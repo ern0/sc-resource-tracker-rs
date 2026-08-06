@@ -37,15 +37,52 @@ extern "C" fn handle_sigterm(_: libc::c_int) {
     SIGTERM_RECEIVED.store(true, Ordering::Relaxed);
 }
 
+// Install SIGTERM and SIGINT handlers so the binary can flush before exiting.
+// Both signals set the same flag and trigger the same graceful shutdown path.
+//
+fn setup_signal_handlers() {
+    unsafe {
+        libc::signal(
+            libc::SIGTERM,
+            handle_sigterm as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGINT,
+            handle_sigterm as *const () as libc::sighandler_t,
+        );
+    }
+}
+
+// -----------------------------------------------------------------------
+// Output sink: stdout (default), file (--output), or suppressed (--quiet).
+// Warnings and errors always go to stderr via eprintln! regardless.
+// -----------------------------------------------------------------------
+//
+fn create_sink(config: &Config) -> Option<std::io::BufWriter<std::fs::File>> {
+    let out_file = if config.quiet {
+        None
+    } else {
+        config.output_file.as_deref().map(|path| {
+            std::io::BufWriter::new(std::fs::File::create(path).unwrap_or_else(|e| {
+                eprintln!("error: cannot open output file {path}: {e}");
+                std::process::exit(1);
+            }))
+        })
+    };
+
+    out_file
+}
+
 // ---------------------------------------------------------------------------
 // Graceful shutdown
 // ---------------------------------------------------------------------------
-
-/// Flush remaining samples, close the Sentinel run, then exit.
-///
-/// Called on both shell-wrapper child exit and SIGTERM.  Replaces the former
-/// bare `std::process::exit()` calls so the upload thread always gets a chance
-/// to flush.
+//
+// Flush remaining samples, close the Sentinel run, then exit.
+//
+// Called on both shell-wrapper child exit and SIGTERM.  Replaces the former
+// bare `std::process::exit()` calls so the upload thread always gets a chance
+// to flush.
+//
 fn shutdown(
     exit_code: i32,
     sentinel: Option<&SentinelClient>,
@@ -89,66 +126,35 @@ fn shutdown(
         }
     }
 
-    std::process::exit(exit_code);
+    std::process::exit(exit_code)
+}
+
+// Emit one line of metric output to the selected sink.
+// quiet=true  -> no-op
+// output_file -> write to file and flush (so `tail -f` works)
+// default     -> eprintln! to stderr (keeps stdout clean for the tracked app)
+//
+fn emit(config: &Config, out_file: &mut Option<std::io::BufWriter<std::fs::File>>, msg: &str) {
+    if !config.quiet {
+        if let Some(f) = out_file {
+            let _ = writeln!(f, "{}", msg);
+            let _ = f.flush();
+        } else {
+            eprintln!("{}", msg);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
-
+//
 fn main() {
-    // Install SIGTERM and SIGINT handlers so the binary can flush before exiting.
-    // Both signals set the same flag and trigger the same graceful shutdown path.
-    unsafe {
-        libc::signal(
-            libc::SIGTERM,
-            handle_sigterm as *const () as libc::sighandler_t,
-        );
-        libc::signal(
-            libc::SIGINT,
-            handle_sigterm as *const () as libc::sighandler_t,
-        );
-    }
-
+    setup_signal_handlers();
     let mut config = Config::load();
-
-    // -----------------------------------------------------------------------
-    // Output sink: stdout (default), file (--output), or suppressed (--quiet).
-    // Warnings and errors always go to stderr via eprintln! regardless.
-    // -----------------------------------------------------------------------
-    let mut out_file: Option<std::io::BufWriter<std::fs::File>> = if config.quiet {
-        None
-    } else {
-        config.output_file.as_deref().map(|path| {
-            std::io::BufWriter::new(std::fs::File::create(path).unwrap_or_else(|e| {
-                eprintln!("error: cannot open output file {path}: {e}");
-                std::process::exit(1);
-            }))
-        })
-    };
-
-    // Emit one line of metric output to the selected sink.
-    // quiet=true  -> no-op
-    // output_file -> write to file and flush (so `tail -f` works)
-    // default     -> eprintln! to stderr (keeps stdout clean for the tracked app)
-    macro_rules! emit {
-        ($($arg:tt)*) => {
-            if !config.quiet {
-                if let Some(ref mut f) = out_file {
-                    let _ = writeln!(f, $($arg)*);
-                    let _ = f.flush();
-                } else {
-                    eprintln!($($arg)*);
-                }
-            }
-        }
-    }
+    let mut out_file = create_sink(&config);
 
     let interval = Duration::from_secs(config.interval_secs);
-
-    // Shell-wrapper child is spawned after warm-up so cloud IMDS probes (ureq may
-    // use helper threads) do not race with fork-heavy stressors under PID limits.
-    let mut child: Option<std::process::Child> = None;
 
     let mut cpu = CpuCollector::new(config.pid);
     let memory = MemoryCollector::new();
@@ -172,11 +178,17 @@ fn main() {
     let _ = cpu.collect();
     let _ = network.collect();
     let _ = disk.collect();
+
     std::thread::sleep(interval);
+
     // Non-blocking: on most non-cloud machines all probes fail fast
     // (EHOSTUNREACH); on cloud machines the matching probe returns in < 100 ms.
     // Either way the result is typically waiting by the time we reach here.
     let mut cloud_info: Option<CloudInfo> = cloud_rx.as_ref().and_then(|rx| rx.try_recv().ok());
+
+    // Shell-wrapper child is spawned after warm-up so cloud IMDS probes (ureq may
+    // use helper threads) do not race with fork-heavy stressors under PID limits.
+    let mut child: Option<std::process::Child> = None;
 
     // -----------------------------------------------------------------------
     // Shell-wrapper mode: spawn the tracked command after warm-up / cloud probe.
@@ -255,7 +267,7 @@ fn main() {
 
     // Emit CSV header once before the loop.
     if config.format == OutputFormat::Csv {
-        emit!("{}", output::csv::csv_header());
+        emit(&config, &mut out_file, output::csv::csv_header());
     }
 
     // Samples collected since the last S3 batch upload (for local fallback).
@@ -330,14 +342,15 @@ fn main() {
                 Ok(mut v) => {
                     v[format!("{}-version", env!("CARGO_PKG_NAME"))] =
                         serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string());
-                    emit!("{}", v);
+                    emit(&config, &mut out_file, &v.to_string());
                 }
                 Err(e) => eprintln!("warn: json serialize error: {e}"),
             },
             OutputFormat::Csv => {
-                emit!(
-                    "{}",
-                    output::csv::sample_to_csv_row(&sample, config.interval_secs)
+                emit(
+                    &config,
+                    &mut out_file,
+                    &output::csv::sample_to_csv_row(&sample, config.interval_secs),
                 );
             }
         }

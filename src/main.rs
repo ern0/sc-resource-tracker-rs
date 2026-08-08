@@ -383,6 +383,7 @@ impl ResourceTracker {
         self.spawn_tracked_command();
         self.setup_sentinel();
         self.emit_csv_header();
+        self.renice_self();
 
         // Main sampling loop
         loop {

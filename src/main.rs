@@ -14,23 +14,34 @@ mod thread_util;
 
 extern crate libc;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use collector::{
-    CpuCollector, DiskCollector, GpuCollector, MemoryCollector, NetworkCollector,
-    collect_host_info, spawn_cloud_discovery,
+    CpuCollector,
+    DiskCollector,
+    GpuCollector,
+    MemoryCollector,
+    NetworkCollector,
+    collect_host_info,
+    spawn_cloud_discovery,
 };
 use config::{Config, OutputFormat};
 use metrics::CloudInfo;
 use metrics::Sample;
-use sentinel::{BatchUploader, RunContext, SentinelClient, close_run, samples_to_csv, start_run};
-use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use sentinel::{
+    BatchUploader,
+    RunContext,
+    SentinelClient,
+    close_run,
+    samples_to_csv,
+    start_run,
+};
 
 // ---------------------------------------------------------------------------
 // SIGTERM handler
 // ---------------------------------------------------------------------------
-
+//
 static SIGTERM_RECEIVED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn handle_sigterm(_: libc::c_int) {
@@ -41,6 +52,7 @@ extern "C" fn handle_sigterm(_: libc::c_int) {
 // Both signals set the same flag and trigger the same graceful shutdown path.
 //
 fn setup_signal_handlers() {
+
     unsafe {
         libc::signal(
             libc::SIGTERM,
@@ -53,24 +65,362 @@ fn setup_signal_handlers() {
     }
 }
 
+struct ResourceTracker {
+
+    config: Config,
+    out_file: Option<std::io::BufWriter<std::fs::File>>,
+    interval: Duration,
+
+    // Collectors
+    cpu: CpuCollector,
+    memory: MemoryCollector,
+    network: NetworkCollector,
+    disk: DiskCollector,
+    gpu: GpuCollector,
+
+    // Cloud and host info
+    host_info: metrics::HostInfo,
+    cloud_info: Option<CloudInfo>,
+    cloud_rx: Option<std::sync::mpsc::Receiver<CloudInfo>>,
+
+    // Child process
+    child: Option<std::process::Child>,
+
+    // Sentinel state
+    sentinel: Option<SentinelClient>,
+    run_ctx_arc: Option<Arc<Mutex<RunContext>>>,
+    sample_buffer: Option<Arc<Mutex<Vec<Sample>>>>,
+    upload_shutdown_flag: Option<Arc<AtomicBool>>,
+    upload_handle: Option<std::thread::JoinHandle<Vec<String>>>,
+
+    // Sample tracking
+    unflushed: Vec<Sample>,
+    prev_loop_start: Option<Instant>,
+}
+
+impl ResourceTracker {
+
+    fn new() -> Self {
+
+        let config = Config::load();
+        let out_file = create_sink(&config);
+        let interval = Duration::from_secs(config.interval_secs);
+
+        let cpu = CpuCollector::new(config.pid);
+        let memory = MemoryCollector::new();
+        let network = NetworkCollector::new();
+        let disk = DiskCollector::new(interval);
+        let gpu = GpuCollector::new();
+
+        // Collect static GPU info now so host discovery can derive GPU host fields.
+        let initial_gpus = gpu.collect().unwrap_or_default();
+
+        // Host discovery: fast, local, no I/O.
+        let host_info = collect_host_info(&initial_gpus);
+
+        // Warm-up: prime delta state in stateful collectors while cloud probes run
+        let cloud_rx = spawn_cloud_discovery();
+        let cloud_info = None;
+
+        Self {
+            config,
+            out_file,
+            interval,
+            cpu,
+            memory,
+            network,
+            disk,
+            gpu,
+            host_info,
+            cloud_info,
+            cloud_rx,
+            child: None,
+            sentinel: None,
+            run_ctx_arc: None,
+            sample_buffer: None,
+            upload_shutdown_flag: None,
+            upload_handle: None,
+            unflushed: Vec::new(),
+            prev_loop_start: None,
+        }
+    }
+
+    fn warmup_collectors(&mut self) {
+
+        let _ = self.cpu.collect();
+        let _ = self.network.collect();
+        let _ = self.disk.collect();
+    }
+
+    fn spawn_tracked_command(&mut self) {
+
+        let Some((program, args)) = self.config.command.split_first() else {
+            return;
+        };
+
+        match std::process::Command::new(program).args(args).spawn() {
+
+            Ok(c) => {
+                self.config.pid = Some(i32::try_from(c.id()).unwrap_or(i32::MAX));
+                self.cpu.set_tracked_pid(self.config.pid);
+                self.child = Some(c);
+            }
+
+            Err(e) => {
+                eprintln!("error: failed to spawn {:?}: {e}", program);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    fn setup_sentinel(&mut self) {
+
+        self.sentinel = SentinelClient::from_env();
+
+        let Some(client) = &self.sentinel else {
+            return;
+        };
+
+        // Bounded wait: give cloud discovery a chance to complete
+        if self.cloud_info.is_none() {
+            if let Some(ref rx) = self.cloud_rx {
+                self.cloud_info = rx.recv_timeout(Duration::from_secs(3)).ok();
+            }
+        }
+
+        let default_cloud = CloudInfo::default();
+        let ctx = match start_run(
+            &client.agent,
+            &client.api_base,
+            &client.token,
+            &self.config.metadata,
+            self.config.pid,
+            &self.host_info,
+            self.cloud_info.as_ref().unwrap_or(&default_cloud),
+        ) {
+            Err(e) => {
+                eprintln!("warn: sentinel start_run failed: {e}; streaming disabled");
+                return;
+            }
+            Ok(ctx) => ctx,
+        };
+
+        let ctx_arc = Arc::new(Mutex::new(ctx));
+        let upload_interval = std::env::var("TRACKER_UPLOAD_INTERVAL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60u64);
+        let (uploader, buf) = BatchUploader::new(upload_interval, self.config.interval_secs);
+        let flag = uploader.shutdown_flag();
+        let upload_handle = uploader.spawn(
+            Arc::clone(&ctx_arc),
+            SentinelClient::new_upload_agent(),
+            client.api_base.clone(),
+            client.token.clone(),
+        );
+        if upload_handle.is_none() {
+            eprintln!(
+                "warn: sentinel background upload disabled; samples will be flushed inline on exit"
+            );
+        }
+
+        self.run_ctx_arc = Some(ctx_arc);
+        self.sample_buffer = Some(buf);
+        self.upload_shutdown_flag = Some(flag);
+        self.upload_handle = upload_handle;
+    }
+
+    fn emit_csv_header(&mut self) {
+
+        if self.config.format == OutputFormat::Csv {
+            emit_metric_line(&self.config, &mut self.out_file, output::csv::csv_header());
+        }
+    }
+
+    fn poll_cloud_info(&mut self) {
+
+        if self.cloud_info.is_none()
+            && let Some(ref rx) = self.cloud_rx
+            && let Ok(info) = rx.try_recv()
+        {
+            self.cloud_info = Some(info);
+        }
+    }
+
+    fn collect_sample(&mut self) -> Sample {
+
+        let loop_start = Instant::now();
+
+        let actual_interval_ms: Option<u64> = self.prev_loop_start
+            .map(|p| u64::try_from((loop_start - p).as_millis()).unwrap_or(u64::MAX));
+
+        let timestamp_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut sample = Sample {
+            timestamp_secs,
+            actual_interval_ms,
+            job_name: self.config.metadata.job_name.clone(),
+            tracked_pid: self.config.pid,
+            cpu: self.cpu.collect().unwrap_or_default(),
+            memory: self.memory.collect().unwrap_or_default(),
+            network: self.network.collect().unwrap_or_default(),
+            disk: self.disk.collect().unwrap_or_default(),
+            gpu: self.gpu.collect().unwrap_or_default(),
+        };
+
+        // Augment with per-process GPU stats.
+        let (vram_mib, gpu_usage, gpu_utilized) =
+            if self.config.pid.is_some() && !sample.cpu.process_tree_pids.is_empty() {
+                let pids_u32: Vec<u32> = sample
+                    .cpu
+                    .process_tree_pids
+                    .iter()
+                    .filter_map(|&p| u32::try_from(p).ok())
+                    .collect();
+                self.gpu.process_gpu_info(&pids_u32, self.interval)
+            } else {
+                self.gpu.all_gpu_process_info(self.interval)
+            };
+        sample.cpu.process_gpu_vram_mib = vram_mib;
+        sample.cpu.process_gpu_usage = gpu_usage;
+        sample.cpu.process_gpu_utilized = gpu_utilized;
+
+        self.prev_loop_start = Some(loop_start);
+        sample
+    }
+
+    fn emit_sample(&mut self, sample: &Sample) {
+
+        match self.config.format {
+
+            OutputFormat::Json => match serde_json::to_value(sample) {
+                Ok(mut v) => {
+                    v[format!("{}-version", env!("CARGO_PKG_NAME"))] =
+                        serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string());
+                    emit_metric_line(
+                        &self.config,
+                        &mut self.out_file,
+                        &v.to_string(),
+                    );
+                }
+                Err(e) => eprintln!("warn: json serialize error: {e}"),
+            },
+
+            OutputFormat::Csv => {
+                emit_metric_line(
+                    &self.config,
+                    &mut self.out_file,
+                    &output::csv::sample_to_csv_row(sample, self.config.interval_secs),
+                );
+            }
+        }
+    }
+
+    fn buffer_sample(&mut self, sample: Sample) {
+
+        // Push to sentinel buffer (if streaming is active).
+        if let Some(ref buf) = self.sample_buffer {
+            buf.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(sample.clone());
+        }
+        self.unflushed.push(sample);
+    }
+
+    fn check_child_exit(&mut self) -> Option<i32> {
+
+        let child = self.child.as_mut()?;
+
+        match child.try_wait() {
+            Ok(Some(status)) => Some(status.code().unwrap_or(1)),
+            Ok(None) => None,
+            Err(e) => {
+                eprintln!("warn: error checking child status: {e}");
+                None
+            }
+        }
+    }
+
+    fn check_signal(&self) -> bool {
+        SIGTERM_RECEIVED.load(Ordering::Relaxed)
+    }
+
+    fn sleep_until_next_interval(&self, loop_start: Instant) {
+
+        let elapsed = loop_start.elapsed();
+        if let Some(remaining) = self.interval.checked_sub(elapsed) {
+            std::thread::sleep(remaining);
+        }
+    }
+
+    fn shutdown(&mut self, exit_code: i32) -> ! {
+
+        // Take ownership of fields that need to be moved
+        let sentinel = self.sentinel.take();
+        let run_ctx = self.run_ctx_arc.take();
+        let shutdown_flag = self.upload_shutdown_flag.take();
+        let upload_handle = self.upload_handle.take();
+        let remaining = std::mem::take(&mut self.unflushed);
+
+        shutdown(
+            exit_code,
+            sentinel.as_ref(),
+            run_ctx,
+            shutdown_flag,
+            upload_handle,
+            remaining,
+            self.config.interval_secs,
+        );
+    }
+
+    fn run(mut self) -> ! {
+
+        self.warmup_collectors();
+        std::thread::sleep(self.interval);
+        self.spawn_tracked_command();
+        self.setup_sentinel();
+        self.emit_csv_header();
+
+        // Main sampling loop
+        loop {
+            self.poll_cloud_info();
+            let loop_start = Instant::now();
+
+            let sample = self.collect_sample();
+            self.emit_sample(&sample);
+            self.buffer_sample(sample);
+
+            if let Some(code) = self.check_child_exit() {
+                self.shutdown(code);
+            }
+
+            if self.check_signal() {
+                self.shutdown(0);
+            }
+
+            self.sleep_until_next_interval(loop_start);
+        }
+    }
+}
+
 // -----------------------------------------------------------------------
 // Output sink: stdout (default), file (--output), or suppressed (--quiet).
 // Warnings and errors always go to stderr via eprintln! regardless.
 // -----------------------------------------------------------------------
 //
-fn create_sink(config: &Config) -> Option<std::io::BufWriter<std::fs::File>> {
-    let out_file = if config.quiet {
-        None
-    } else {
-        config.output_file.as_deref().map(|path| {
-            std::io::BufWriter::new(std::fs::File::create(path).unwrap_or_else(|e| {
-                eprintln!("error: cannot open output file {path}: {e}");
-                std::process::exit(1);
-            }))
-        })
-    };
+fn create_sink(config: &Config) -> Option<BufWriter<File>> {
 
-    out_file
+    if config.quiet {
+        return None;
+    }
+
+    match config.output_file.as_deref() {
+        Some(path) => File::create(path).map(BufWriter::new).ok(),
+        None => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -92,6 +442,7 @@ fn shutdown(
     remaining: Vec<Sample>,
     interval_secs: u64,
 ) -> ! {
+
     if let (Some(client), Some(ctx_arc), Some(flag), Some(handle)) =
         (sentinel, run_ctx, shutdown_flag, upload_handle)
     {
@@ -126,7 +477,7 @@ fn shutdown(
         }
     }
 
-    std::process::exit(exit_code)
+    std::process::exit(exit_code);
 }
 
 // Emit one line of metric output to the selected sink.
@@ -134,282 +485,31 @@ fn shutdown(
 // output_file -> write to file and flush (so `tail -f` works)
 // default     -> eprintln! to stderr (keeps stdout clean for the tracked app)
 //
-fn emit(config: &Config, out_file: &mut Option<std::io::BufWriter<std::fs::File>>, msg: &str) {
-    if !config.quiet {
-        if let Some(f) = out_file {
-            let _ = writeln!(f, "{}", msg);
-            let _ = f.flush();
-        } else {
-            eprintln!("{}", msg);
+use std::io::{Write, BufWriter};
+use std::fs::File;
+
+fn emit_metric_line(config: &Config, out_file: &mut Option<BufWriter<File>>, msg: &str) {
+
+    if config.quiet {
+        return;
+    }
+
+    match out_file {
+        Some(writer) => {
+            let _ = writeln!(writer, "{msg}");
+            let _ = writer.flush();
         }
+        None => eprintln!("{msg}"),
     }
 }
-
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 //
 fn main() {
     setup_signal_handlers();
-    let mut config = Config::load();
-    let mut out_file = create_sink(&config);
-
-    let interval = Duration::from_secs(config.interval_secs);
-
-    let mut cpu = CpuCollector::new(config.pid);
-    let memory = MemoryCollector::new();
-    let mut network = NetworkCollector::new();
-    let mut disk = DiskCollector::new(interval);
-    let mut gpu = GpuCollector::new();
-
-    // Collect static GPU info now so host discovery can derive GPU host fields.
-    let initial_gpus = gpu.collect().unwrap_or_default();
-
-    // Host discovery: fast, local, no I/O.
-    let host_info = collect_host_info(&initial_gpus);
-
-    // Warm-up: prime delta state in stateful collectors while cloud probes run
-    // in the background. spawn_cloud_discovery returns a channel Receiver so
-    // the caller never blocks on probe completion -- try_recv() picks up the
-    // result if probes finished during the sleep, or leaves cloud_info as None
-    // to be resolved later (per-tick poll in the main loop, or recv_timeout
-    // before start_run for Sentinel runs).
-    let cloud_rx = spawn_cloud_discovery();
-    let _ = cpu.collect();
-    let _ = network.collect();
-    let _ = disk.collect();
-
-    std::thread::sleep(interval);
-
-    // Non-blocking: on most non-cloud machines all probes fail fast
-    // (EHOSTUNREACH); on cloud machines the matching probe returns in < 100 ms.
-    // Either way the result is typically waiting by the time we reach here.
-    let mut cloud_info: Option<CloudInfo> = cloud_rx.as_ref().and_then(|rx| rx.try_recv().ok());
-
-    // Shell-wrapper child is spawned after warm-up so cloud IMDS probes (ureq may
-    // use helper threads) do not race with fork-heavy stressors under PID limits.
-    let mut child: Option<std::process::Child> = None;
-
-    // -----------------------------------------------------------------------
-    // Shell-wrapper mode: spawn the tracked command after warm-up / cloud probe.
-    // -----------------------------------------------------------------------
-    if !config.command.is_empty() {
-        let (program, args) = config.command.split_first().expect("command is non-empty");
-        match std::process::Command::new(program).args(args).spawn() {
-            Ok(c) => {
-                config.pid = Some(i32::try_from(c.id()).unwrap_or(i32::MAX));
-                cpu.set_tracked_pid(config.pid);
-                child = Some(c);
-            }
-            Err(e) => {
-                eprintln!("error: failed to spawn {:?}: {e}", program);
-                std::process::exit(1);
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Sentinel API setup (gated on SENTINEL_API_TOKEN being set).
-    // -----------------------------------------------------------------------
-    let sentinel = SentinelClient::from_env();
-
-    let (run_ctx_arc, sample_buffer, upload_shutdown_flag, upload_handle) = match &sentinel {
-        None => (None, None, None, None),
-        Some(client) => {
-            // Bounded wait: give cloud discovery a chance to complete before
-            // start_run so the run record carries cloud metadata. IMDS probes
-            // run in parallel and finish within IMDS_TIMEOUT (1 s); 3 s is a
-            // generous ceiling for unusual network paths. Pure metric runs
-            // (no Sentinel token) skip this entirely.
-            if cloud_info.is_none() {
-                if let Some(ref rx) = cloud_rx {
-                    cloud_info = rx.recv_timeout(Duration::from_secs(3)).ok();
-                }
-            }
-            let default_cloud = CloudInfo::default();
-            match start_run(
-                &client.agent,
-                &client.api_base,
-                &client.token,
-                &config.metadata,
-                config.pid,
-                &host_info,
-                cloud_info.as_ref().unwrap_or(&default_cloud),
-            ) {
-                Err(e) => {
-                    eprintln!("warn: sentinel start_run failed: {e}; streaming disabled");
-                    (None, None, None, None)
-                }
-                Ok(ctx) => {
-                    let ctx_arc = Arc::new(Mutex::new(ctx));
-                    let upload_interval = std::env::var("TRACKER_UPLOAD_INTERVAL")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(60u64);
-                    let (uploader, buf) = BatchUploader::new(upload_interval, config.interval_secs);
-                    let flag = uploader.shutdown_flag();
-                    let upload_handle = uploader.spawn(
-                        Arc::clone(&ctx_arc),
-                        SentinelClient::new_upload_agent(),
-                        client.api_base.clone(),
-                        client.token.clone(),
-                    );
-                    if upload_handle.is_none() {
-                        eprintln!(
-                            "warn: sentinel background upload disabled; samples will be flushed inline on exit"
-                        );
-                    }
-                    (Some(ctx_arc), Some(buf), Some(flag), upload_handle)
-                }
-            }
-        }
-    };
-
-    // Emit CSV header once before the loop.
-    if config.format == OutputFormat::Csv {
-        emit(&config, &mut out_file, output::csv::csv_header());
-    }
-
-    // Samples collected since the last S3 batch upload (for local fallback).
-    let mut unflushed: Vec<Sample> = Vec::new();
-
-    // Tracks the Instant at the start of each loop iteration so we can
-    // compute the actual elapsed interval between samples and sleep only
-    // for the remainder of the nominal interval (deadline-based scheduling).
-    let mut prev_loop_start: Option<Instant> = None;
-
-    // -----------------------------------------------------------------------
-    // Main sampling loop
-    // -----------------------------------------------------------------------
-    loop {
-        // Poll for cloud discovery result if not yet received. Typically a
-        // no-op because probes complete within IMDS_TIMEOUT and the warm-up
-        // sleep covers that window. Ensures the channel is drained and
-        // cloud_info is populated for any future use.
-        if cloud_info.is_none()
-            && let Some(ref rx) = cloud_rx
-            && let Ok(info) = rx.try_recv()
-        {
-            cloud_info = Some(info);
-        }
-
-        let loop_start = Instant::now();
-
-        // Actual elapsed since the previous iteration started.  None on the
-        // first real sample (no prior loop start to compare against).
-        let actual_interval_ms: Option<u64> = prev_loop_start
-            .map(|p| u64::try_from((loop_start - p).as_millis()).unwrap_or(u64::MAX));
-
-        let timestamp_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        let mut sample = Sample {
-            timestamp_secs,
-            actual_interval_ms,
-            job_name: config.metadata.job_name.clone(),
-            tracked_pid: config.pid,
-            cpu: cpu.collect().unwrap_or_default(),
-            memory: memory.collect().unwrap_or_default(),
-            network: network.collect().unwrap_or_default(),
-            disk: disk.collect().unwrap_or_default(),
-            gpu: gpu.collect().unwrap_or_default(),
-        };
-
-        // Augment with per-process GPU stats.
-        // With --pid: filter to the tracked process tree.
-        // Without --pid: report system-wide GPU allocation (all processes).
-        let (vram_mib, gpu_usage, gpu_utilized) =
-            if config.pid.is_some() && !sample.cpu.process_tree_pids.is_empty() {
-                let pids_u32: Vec<u32> = sample
-                    .cpu
-                    .process_tree_pids
-                    .iter()
-                    .filter_map(|&p| u32::try_from(p).ok())
-                    .collect();
-                gpu.process_gpu_info(&pids_u32, interval)
-            } else {
-                gpu.all_gpu_process_info(interval)
-            };
-        sample.cpu.process_gpu_vram_mib = vram_mib;
-        sample.cpu.process_gpu_usage = gpu_usage;
-        sample.cpu.process_gpu_utilized = gpu_utilized;
-
-        // Emit to selected output sink.
-        match config.format {
-            OutputFormat::Json => match serde_json::to_value(&sample) {
-                Ok(mut v) => {
-                    v[format!("{}-version", env!("CARGO_PKG_NAME"))] =
-                        serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string());
-                    emit(&config, &mut out_file, &v.to_string());
-                }
-                Err(e) => eprintln!("warn: json serialize error: {e}"),
-            },
-            OutputFormat::Csv => {
-                emit(
-                    &config,
-                    &mut out_file,
-                    &output::csv::sample_to_csv_row(&sample, config.interval_secs),
-                );
-            }
-        }
-
-        // Push to sentinel buffer (if streaming is active).
-        if let Some(ref buf) = sample_buffer {
-            buf.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(sample.clone());
-        }
-        unflushed.push(sample);
-
-        // -----------------------------------------------------------------------
-        // Shell-wrapper exit check
-        // -----------------------------------------------------------------------
-        if let Some(ref mut c) = child {
-            match c.try_wait() {
-                Ok(Some(status)) => {
-                    let code = status.code().unwrap_or(1);
-                    shutdown(
-                        code,
-                        sentinel.as_ref(),
-                        run_ctx_arc,
-                        upload_shutdown_flag,
-                        upload_handle,
-                        unflushed,
-                        config.interval_secs,
-                    );
-                }
-                Ok(None) => {}
-                Err(e) => eprintln!("warn: error checking child status: {e}"),
-            }
-        }
-
-        // SIGTERM received: flush and exit cleanly.
-        if SIGTERM_RECEIVED.load(Ordering::Relaxed) {
-            shutdown(
-                0,
-                sentinel.as_ref(),
-                run_ctx_arc,
-                upload_shutdown_flag,
-                upload_handle,
-                unflushed,
-                config.interval_secs,
-            );
-        }
-
-        prev_loop_start = Some(loop_start);
-
-        // Deadline-based sleep: sleep only for the time remaining in the
-        // nominal interval.  If collection itself took longer than the
-        // interval, skip sleeping entirely and start the next sample right
-        // away.  This prevents drift accumulation and matches the Python
-        // resource-tracker's timer approach.
-        let elapsed = loop_start.elapsed();
-        if let Some(remaining) = interval.checked_sub(elapsed) {
-            std::thread::sleep(remaining);
-        }
-    }
+    let tracker = ResourceTracker::new();
+    tracker.run();
 }
 
 // ---------------------------------------------------------------------------

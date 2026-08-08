@@ -20,10 +20,6 @@ install: build_release
 run_only_show_key_names:
      target/release/resource-tracker --interval 3 | jq -r 'paths(scalars) as $p | "\($p | join(".")): \(getpath($p) | type)"'
 
-launch:
-	clear
-	target/debug/resource-tracker
-
 # Build mdbook and then cargo doc bundled inside, then open the main page
 document:
     (cd resource-tracker-rs-book && mdbook build) & cargo doc --no-deps --offline --target-dir resource-tracker-rs-book/book/cargo/ & wait

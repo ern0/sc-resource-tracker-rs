@@ -1,3 +1,4 @@
+#![warn(clippy::pedantic)]
 #![doc = include_str!("../README.md")]
 
 #[cfg(not(target_os = "linux"))]
@@ -14,6 +15,8 @@ mod thread_util;
 
 extern crate libc;
 
+use std::io::{Write, BufWriter};
+use std::fs::File;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -103,7 +106,7 @@ impl ResourceTracker {
     fn new() -> Self {
 
         let config = Config::load();
-        let out_file = create_sink(&config);
+        let out_file = Self::create_sink(&config);
         let interval = Duration::from_secs(config.interval_secs);
 
         let cpu = CpuCollector::new(config.pid);
@@ -233,11 +236,11 @@ impl ResourceTracker {
     fn emit_csv_header(&mut self) {
 
         if self.config.format == OutputFormat::Csv {
-            emit_metric_line(&self.config, &mut self.out_file, output::csv::csv_header());
+            Self::emit_metric_line(&self.config, &mut self.out_file, output::csv::csv_header());
         }
     }
 
-    fn renice_self(&self) {
+    fn renice_tracker(&self) {
 
         let Some(renice) = self.config.renice else {
             return;
@@ -303,6 +306,7 @@ impl ResourceTracker {
         sample.cpu.process_gpu_utilized = gpu_utilized;
 
         self.prev_loop_start = Some(loop_start);
+
         sample
     }
 
@@ -314,7 +318,7 @@ impl ResourceTracker {
                 Ok(mut v) => {
                     v[format!("{}-version", env!("CARGO_PKG_NAME"))] =
                         serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string());
-                    emit_metric_line(
+                    Self::emit_metric_line(
                         &self.config,
                         &mut self.out_file,
                         &v.to_string(),
@@ -324,7 +328,7 @@ impl ResourceTracker {
             },
 
             OutputFormat::Csv => {
-                emit_metric_line(
+                Self::emit_metric_line(
                     &self.config,
                     &mut self.out_file,
                     &output::csv::sample_to_csv_row(sample, self.config.interval_secs),
@@ -379,7 +383,7 @@ impl ResourceTracker {
         let upload_handle = self.upload_handle.take();
         let remaining = std::mem::take(&mut self.unflushed);
 
-        shutdown(
+        Self::graceful_shutdown(
             exit_code,
             sentinel.as_ref(),
             run_ctx,
@@ -394,10 +398,11 @@ impl ResourceTracker {
 
         self.warmup_collectors();
         std::thread::sleep(self.interval);
+
         self.spawn_tracked_command();
         self.setup_sentinel();
         self.emit_csv_header();
-        self.renice_self();
+        self.renice_tracker();
 
         // Main sampling loop
         loop {
@@ -411,7 +416,6 @@ impl ResourceTracker {
             if let Some(code) = self.check_child_exit() {
                 self.shutdown(code);
             }
-
             if self.check_signal() {
                 self.shutdown(0);
             }
@@ -419,104 +423,103 @@ impl ResourceTracker {
             self.sleep_until_next_interval(loop_start);
         }
     }
-}
 
-// -----------------------------------------------------------------------
-// Output sink: stdout (default), file (--output), or suppressed (--quiet).
-// Warnings and errors always go to stderr via eprintln! regardless.
-// -----------------------------------------------------------------------
-//
-fn create_sink(config: &Config) -> Option<BufWriter<File>> {
 
-    if config.quiet {
-        return None;
-    }
+    // -----------------------------------------------------------------------
+    // Output sink: stdout (default), file (--output), or suppressed (--quiet).
+    // Warnings and errors always go to stderr via eprintln! regardless.
+    // -----------------------------------------------------------------------
+    //
+    fn create_sink(config: &Config) -> Option<BufWriter<File>> {
 
-    match config.output_file.as_deref() {
-        Some(path) => File::create(path).map(BufWriter::new).ok(),
-        None => None,
-    }
-}
+        if config.quiet {
+            return None;
+        }
 
-// ---------------------------------------------------------------------------
-// Graceful shutdown
-// ---------------------------------------------------------------------------
-//
-// Flush remaining samples, close the Sentinel run, then exit.
-//
-// Called on both shell-wrapper child exit and SIGTERM.  Replaces the former
-// bare `std::process::exit()` calls so the upload thread always gets a chance
-// to flush.
-//
-fn shutdown(
-    exit_code: i32,
-    sentinel: Option<&SentinelClient>,
-    run_ctx: Option<Arc<Mutex<RunContext>>>,
-    shutdown_flag: Option<Arc<AtomicBool>>,
-    upload_handle: Option<std::thread::JoinHandle<Vec<String>>>,
-    remaining: Vec<Sample>,
-    interval_secs: u64,
-) -> ! {
-
-    if let (Some(client), Some(ctx_arc), Some(flag), Some(handle)) =
-        (sentinel, run_ctx, shutdown_flag, upload_handle)
-    {
-        // Signal the upload thread to flush its buffer to S3, then wait for it.
-        // The thread performs one final S3 upload of any remaining buffered samples
-        // before it exits, and returns the list of all successfully uploaded URIs.
-        flag.store(true, Ordering::Relaxed);
-        let uploaded_uris = handle.join().unwrap_or_default();
-
-        // Route selection:
-        //   S3 route   -- at least one batch was uploaded; uploaded_uris is non-empty.
-        //                 The final flush is already included in uploaded_uris.
-        //   Inline route -- no S3 uploads (short run or all S3 failures); send all
-        //                   collected samples as a raw CSV string.
-        let remaining_csv = if uploaded_uris.is_empty() && !remaining.is_empty() {
-            Some(samples_to_csv(&remaining, interval_secs))
-        } else {
-            None
-        };
-
-        let ctx = ctx_arc.lock().unwrap_or_else(|e| e.into_inner());
-        if let Err(e) = close_run(
-            &client.agent,
-            &client.api_base,
-            &client.token,
-            &ctx,
-            Some(exit_code),
-            remaining_csv,
-            &uploaded_uris,
-        ) {
-            eprintln!("warn: sentinel close_run failed: {e}");
+        match config.output_file.as_deref() {
+            Some(path) => File::create(path).map(BufWriter::new).ok(),
+            None => None,
         }
     }
 
-    std::process::exit(exit_code);
-}
+    // ---------------------------------------------------------------------------
+    // Graceful shutdown
+    // ---------------------------------------------------------------------------
+    //
+    // Flush remaining samples, close the Sentinel run, then exit.
+    //
+    // Called on both shell-wrapper child exit and SIGTERM.  Replaces the former
+    // bare `std::process::exit()` calls so the upload thread always gets a chance
+    // to flush.
+    //
+    fn graceful_shutdown(
+        exit_code: i32,
+        sentinel: Option<&SentinelClient>,
+        run_ctx: Option<Arc<Mutex<RunContext>>>,
+        shutdown_flag: Option<Arc<AtomicBool>>,
+        upload_handle: Option<std::thread::JoinHandle<Vec<String>>>,
+        remaining: Vec<Sample>,
+        interval_secs: u64,
+    ) -> ! {
 
-// Emit one line of metric output to the selected sink.
-// quiet=true  -> no-op
-// output_file -> write to file and flush (so `tail -f` works)
-// default     -> eprintln! to stderr (keeps stdout clean for the tracked app)
-//
-use std::io::{Write, BufWriter};
-use std::fs::File;
+        if let (Some(client), Some(ctx_arc), Some(flag), Some(handle)) =
+            (sentinel, run_ctx, shutdown_flag, upload_handle)
+        {
+            // Signal the upload thread to flush its buffer to S3, then wait for it.
+            // The thread performs one final S3 upload of any remaining buffered samples
+            // before it exits, and returns the list of all successfully uploaded URIs.
+            flag.store(true, Ordering::Relaxed);
+            let uploaded_uris = handle.join().unwrap_or_default();
 
-fn emit_metric_line(config: &Config, out_file: &mut Option<BufWriter<File>>, msg: &str) {
+            // Route selection:
+            //   S3 route   -- at least one batch was uploaded; uploaded_uris is non-empty.
+            //                 The final flush is already included in uploaded_uris.
+            //   Inline route -- no S3 uploads (short run or all S3 failures); send all
+            //                   collected samples as a raw CSV string.
+            let remaining_csv = if uploaded_uris.is_empty() && !remaining.is_empty() {
+                Some(samples_to_csv(&remaining, interval_secs))
+            } else {
+                None
+            };
 
-    if config.quiet {
-        return;
-    }
-
-    match out_file {
-        Some(writer) => {
-            let _ = writeln!(writer, "{msg}");
-            let _ = writer.flush();
+            let ctx = ctx_arc.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(e) = close_run(
+                &client.agent,
+                &client.api_base,
+                &client.token,
+                &ctx,
+                Some(exit_code),
+                remaining_csv,
+                &uploaded_uris,
+            ) {
+                eprintln!("warn: sentinel close_run failed: {e}");
+            }
         }
-        None => eprintln!("{msg}"),
+
+        std::process::exit(exit_code);
+    }
+
+    // Emit one line of metric output to the selected sink.
+    // quiet=true  -> no-op
+    // output_file -> write to file and flush (so `tail -f` works)
+    // default     -> eprintln! to stderr (keeps stdout clean for the tracked app)
+    //
+    fn emit_metric_line(config: &Config, out_file: &mut Option<BufWriter<File>>, msg: &str) {
+
+        if config.quiet {
+            return;
+        }
+
+        match out_file {
+            Some(writer) => {
+                let _ = writeln!(writer, "{msg}");
+                let _ = writer.flush();
+            }
+            None => eprintln!("{msg}"),
+        }
     }
 }
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------

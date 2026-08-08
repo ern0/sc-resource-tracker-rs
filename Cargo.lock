@@ -806,7 +806,7 @@ dependencies = [
 
 [[package]]
 name = "resource-tracker"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "clap",
  "flate2",

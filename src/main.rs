@@ -237,6 +237,20 @@ impl ResourceTracker {
         }
     }
 
+    fn renice_self(&self) {
+
+        let Some(renice) = self.config.renice else {
+            return;
+        };
+
+        let result = unsafe {
+            libc::setpriority(libc::PRIO_PROCESS, 0, renice)
+        };
+        if result == -1 {
+            eprintln!("warn: failed to renice process, ignored");
+        }
+    }
+
     fn poll_cloud_info(&mut self) {
 
         if self.cloud_info.is_none()

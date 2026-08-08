@@ -2,12 +2,14 @@ use clap::{ArgAction, Parser, ValueEnum};
 use serde::Deserialize;
 
 const DEFAULT_INTERVAL_SECS: u64 = 1;
+const RENICE_MIN: i64 = 0;
+const RENICE_MAX: i64 = 19;
 const DEFAULT_CONFIG_FILE: &str = "resource-tracker.toml";
 
 // ---------------------------------------------------------------------------
 // Output format
 // ---------------------------------------------------------------------------
-
+//
 /// Output format emitted to stdout on each polling interval.
 #[derive(Debug, Clone, Copy, PartialEq, ValueEnum)]
 pub enum OutputFormat {
@@ -21,7 +23,7 @@ pub enum OutputFormat {
 // ---------------------------------------------------------------------------
 // TOML file structure
 // ---------------------------------------------------------------------------
-
+//
 #[derive(Debug, Default, Deserialize)]
 struct TomlConfig {
     job: Option<TomlJob>,
@@ -40,12 +42,14 @@ struct TomlJob {
 struct TomlTracker {
     /// How often to emit a sample, in seconds. Default: 1.
     interval_secs: Option<u64>,
+    /// Resource tracker nice value. Default: no change.
+    renice: Option<i32>,
 }
 
 // ---------------------------------------------------------------------------
 // Job metadata (Section 9.3) - sent to Sentinel API at run registration
 // ---------------------------------------------------------------------------
-
+//
 /// All optional metadata fields from Section 9.3 of the spec.
 /// Accepted via CLI flags and TRACKER_* environment variables.
 /// Used when registering a run with the Sentinel API (Priority 4).
@@ -72,7 +76,7 @@ pub struct JobMetadata {
 // ---------------------------------------------------------------------------
 // CLI arguments (clap derive)
 // ---------------------------------------------------------------------------
-
+//
 #[derive(Debug, Parser)]
 #[command(
     name = "resource-tracker",
@@ -82,6 +86,7 @@ pub struct JobMetadata {
     version
 )]
 struct Cli {
+
     // -- Core flags ----------------------------------------------------------
     /// Root PID of the process tree to track CPU usage for.
     /// Overridden automatically in shell-wrapper mode.
@@ -91,6 +96,19 @@ struct Cli {
     /// Polling interval in seconds (must be >= 1).
     #[arg(short = 'i', long, value_name = "SECS")]
     interval: Option<u64>,
+
+    /// Nice value for the tracker process: 0 .. 19.
+    /// Bare --renice uses the default 19.
+    #[arg(
+        short = 'r',
+        long = "renice",
+        value_name = "VALUE",
+        env = "TRACKER_RENICE",
+        num_args = 0..=1,
+        default_missing_value = "19",
+        value_parser = clap::value_parser!(i32).range(RENICE_MIN..=RENICE_MAX),
+    )]
+    renice: Option<i32>,
 
     /// Path to TOML config file.
     #[arg(short = 'c', long, value_name = "FILE", default_value = DEFAULT_CONFIG_FILE)]
@@ -173,15 +191,18 @@ struct Cli {
 // ---------------------------------------------------------------------------
 // Merged config
 // ---------------------------------------------------------------------------
-
+//
 /// Resolved configuration after merging CLI args > TOML file > defaults.
 #[derive(Debug, Clone)]
 pub struct Config {
+
     /// Root PID for per-process CPU attribution. None = system-wide only.
     /// Set automatically from the spawned child PID in shell-wrapper mode.
     pub pid: Option<i32>,
     /// Polling interval in seconds.
     pub interval_secs: u64,
+    /// Nice value applied to the tracker process itself (0..=19).
+    pub renice: Option<i32>,
     /// Output format (JSON or CSV).
     pub format: OutputFormat,
     /// Write metric output to this file path instead of stdout.
@@ -196,9 +217,11 @@ pub struct Config {
 }
 
 impl Config {
+
     /// Parse CLI args, optionally load the TOML config file, and merge with
     /// defaults.  CLI flags always win; config file wins over defaults.
     pub fn load() -> Self {
+
         let cli = Cli::parse();
 
         // Silently skip missing or unparseable config files.
@@ -216,6 +239,10 @@ impl Config {
             eprintln!("error: --interval must be >= 1 (got 0)");
             std::process::exit(1);
         }
+
+        let renice = cli
+            .renice
+            .or_else(|| toml.tracker.as_ref().and_then(|t| t.renice));
 
         let pid = cli.pid.or_else(|| toml.job.as_ref().and_then(|j| j.pid));
 
@@ -240,6 +267,7 @@ impl Config {
         Config {
             pid,
             interval_secs,
+            renice,
             format: cli.format,
             output_file: cli.output,
             quiet: cli.quiet,

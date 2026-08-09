@@ -15,31 +15,19 @@ mod thread_util;
 
 extern crate libc;
 
-use std::io::{Write, BufWriter};
-use std::fs::File;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use collector::{
-    CpuCollector,
-    DiskCollector,
-    GpuCollector,
-    MemoryCollector,
-    NetworkCollector,
-    collect_host_info,
-    spawn_cloud_discovery,
+    CpuCollector, DiskCollector, GpuCollector, MemoryCollector, NetworkCollector,
+    collect_host_info, spawn_cloud_discovery,
 };
 use config::{Config, OutputFormat};
 use metrics::CloudInfo;
 use metrics::Sample;
-use sentinel::{
-    BatchUploader,
-    RunContext,
-    SentinelClient,
-    close_run,
-    samples_to_csv,
-    start_run,
-};
+use sentinel::{BatchUploader, RunContext, SentinelClient, close_run, samples_to_csv, start_run};
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------
 // SIGTERM handler
@@ -55,7 +43,6 @@ extern "C" fn handle_sigterm(_: libc::c_int) {
 // Both signals set the same flag and trigger the same graceful shutdown path.
 //
 fn setup_signal_handlers() {
-
     unsafe {
         libc::signal(
             libc::SIGTERM,
@@ -69,7 +56,6 @@ fn setup_signal_handlers() {
 }
 
 struct ResourceTracker {
-
     config: Config,
     out_file: Option<std::io::BufWriter<std::fs::File>>,
     interval: Duration,
@@ -102,9 +88,7 @@ struct ResourceTracker {
 }
 
 impl ResourceTracker {
-
     fn new() -> Self {
-
         let config = Config::load();
         let out_file = Self::create_sink(&config);
         let interval = Duration::from_secs(config.interval_secs);
@@ -149,20 +133,17 @@ impl ResourceTracker {
     }
 
     fn warmup_collectors(&mut self) {
-
         let _ = self.cpu.collect();
         let _ = self.network.collect();
         let _ = self.disk.collect();
     }
 
     fn spawn_tracked_command(&mut self) {
-
         let Some((program, args)) = self.config.command.split_first() else {
             return;
         };
 
         match std::process::Command::new(program).args(args).spawn() {
-
             Ok(c) => {
                 self.config.pid = Some(i32::try_from(c.id()).unwrap_or(i32::MAX));
                 self.cpu.set_tracked_pid(self.config.pid);
@@ -177,7 +158,6 @@ impl ResourceTracker {
     }
 
     fn setup_sentinel(&mut self) {
-
         self.sentinel = SentinelClient::from_env();
 
         let Some(client) = &self.sentinel else {
@@ -234,28 +214,23 @@ impl ResourceTracker {
     }
 
     fn emit_csv_header(&mut self) {
-
         if self.config.format == OutputFormat::Csv {
             Self::emit_metric_line(&self.config, &mut self.out_file, output::csv::csv_header());
         }
     }
 
     fn renice_tracker(&self) {
-
         let Some(renice) = self.config.renice else {
             return;
         };
 
-        let result = unsafe {
-            libc::setpriority(libc::PRIO_PROCESS, 0, renice)
-        };
+        let result = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, renice) };
         if result == -1 {
             eprintln!("warn: failed to renice process, ignored");
         }
     }
 
     fn poll_cloud_info(&mut self) {
-
         if self.cloud_info.is_none()
             && let Some(ref rx) = self.cloud_rx
             && let Ok(info) = rx.try_recv()
@@ -265,10 +240,10 @@ impl ResourceTracker {
     }
 
     fn collect_sample(&mut self) -> Sample {
-
         let loop_start = Instant::now();
 
-        let actual_interval_ms: Option<u64> = self.prev_loop_start
+        let actual_interval_ms: Option<u64> = self
+            .prev_loop_start
             .map(|p| u64::try_from((loop_start - p).as_millis()).unwrap_or(u64::MAX));
 
         let timestamp_secs = SystemTime::now()
@@ -311,18 +286,12 @@ impl ResourceTracker {
     }
 
     fn emit_sample(&mut self, sample: &Sample) {
-
         match self.config.format {
-
             OutputFormat::Json => match serde_json::to_value(sample) {
                 Ok(mut v) => {
                     v[format!("{}-version", env!("CARGO_PKG_NAME"))] =
                         serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string());
-                    Self::emit_metric_line(
-                        &self.config,
-                        &mut self.out_file,
-                        &v.to_string(),
-                    );
+                    Self::emit_metric_line(&self.config, &mut self.out_file, &v.to_string());
                 }
                 Err(e) => eprintln!("warn: json serialize error: {e}"),
             },
@@ -338,7 +307,6 @@ impl ResourceTracker {
     }
 
     fn buffer_sample(&mut self, sample: Sample) {
-
         // Push to sentinel buffer (if streaming is active).
         if let Some(ref buf) = self.sample_buffer {
             buf.lock()
@@ -349,7 +317,6 @@ impl ResourceTracker {
     }
 
     fn check_child_exit(&mut self) -> Option<i32> {
-
         let child = self.child.as_mut()?;
 
         match child.try_wait() {
@@ -367,7 +334,6 @@ impl ResourceTracker {
     }
 
     fn sleep_until_next_interval(&self, loop_start: Instant) {
-
         let elapsed = loop_start.elapsed();
         if let Some(remaining) = self.interval.checked_sub(elapsed) {
             std::thread::sleep(remaining);
@@ -375,7 +341,6 @@ impl ResourceTracker {
     }
 
     fn shutdown(&mut self, exit_code: i32) -> ! {
-
         // Take ownership of fields that need to be moved
         let sentinel = self.sentinel.take();
         let run_ctx = self.run_ctx_arc.take();
@@ -395,7 +360,6 @@ impl ResourceTracker {
     }
 
     fn run(mut self) -> ! {
-
         self.warmup_collectors();
         std::thread::sleep(self.interval);
 
@@ -424,14 +388,12 @@ impl ResourceTracker {
         }
     }
 
-
     // -----------------------------------------------------------------------
     // Output sink: stdout (default), file (--output), or suppressed (--quiet).
     // Warnings and errors always go to stderr via eprintln! regardless.
     // -----------------------------------------------------------------------
     //
     fn create_sink(config: &Config) -> Option<BufWriter<File>> {
-
         if config.quiet {
             return None;
         }
@@ -461,7 +423,6 @@ impl ResourceTracker {
         remaining: Vec<Sample>,
         interval_secs: u64,
     ) -> ! {
-
         if let (Some(client), Some(ctx_arc), Some(flag), Some(handle)) =
             (sentinel, run_ctx, shutdown_flag, upload_handle)
         {
@@ -505,7 +466,6 @@ impl ResourceTracker {
     // default     -> eprintln! to stderr (keeps stdout clean for the tracked app)
     //
     fn emit_metric_line(config: &Config, out_file: &mut Option<BufWriter<File>>, msg: &str) {
-
         if config.quiet {
             return;
         }

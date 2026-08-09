@@ -86,7 +86,6 @@ pub struct JobMetadata {
     version
 )]
 struct Cli {
-
     // -- Core flags ----------------------------------------------------------
     /// Root PID of the process tree to track CPU usage for.
     /// Overridden automatically in shell-wrapper mode.
@@ -195,7 +194,6 @@ struct Cli {
 /// Resolved configuration after merging CLI args > TOML file > defaults.
 #[derive(Debug, Clone)]
 pub struct Config {
-
     /// Root PID for per-process CPU attribution. None = system-wide only.
     /// Set automatically from the spawned child PID in shell-wrapper mode.
     pub pid: Option<i32>,
@@ -217,11 +215,9 @@ pub struct Config {
 }
 
 impl Config {
-
     /// Parse CLI args, optionally load the TOML config file, and merge with
     /// defaults.  CLI flags always win; config file wins over defaults.
     pub fn load() -> Self {
-
         let cli = Cli::parse();
 
         // Silently skip missing or unparseable config files.

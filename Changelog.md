@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.1.15] - 2026-08-08
+## [0.1.15] - 2026-08-09
 
 ### Option for renice resource-tracker process
 
@@ -8,11 +8,16 @@ The tracker can now adjust its own priority (`nice` level)
 to ensure maximum CPU resources remain allocated to the traced process.
 The `nice` level is only set after spawning the target process,
 so it doesn't inherit it.
+Note that priority can be increased,
+but it requires `root` privileges.
 
 The option can be set with
 - CLI flag: `-r` or `--renice`,
 - environment variable: `TRACKER_RENICE`,
 - or configuration item: `[tracker]` section, `renice` property.
+
+Even if the OS call fails on a valid `nice` value
+only triggers a warning, the program does not stop.
 
 Under the hood, no external libraries are used -
 the price for that is

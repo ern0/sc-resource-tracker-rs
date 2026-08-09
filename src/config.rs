@@ -2,7 +2,7 @@ use clap::{ArgAction, Parser, ValueEnum};
 use serde::Deserialize;
 
 const DEFAULT_INTERVAL_SECS: u64 = 1;
-const RENICE_MIN: i64 = 0;
+const RENICE_MIN: i64 = -20;
 const RENICE_MAX: i64 = 19;
 const DEFAULT_CONFIG_FILE: &str = "resource-tracker.toml";
 
@@ -96,8 +96,9 @@ struct Cli {
     #[arg(short = 'i', long, value_name = "SECS")]
     interval: Option<u64>,
 
-    /// Nice value for the tracker process: 0 .. 19.
+    /// Nice value for the tracker process: -20 .. 19.
     /// Bare --renice uses the default 19.
+    /// Increasing priority requires root privileges (see: man nice).
     #[arg(
         short = 'r',
         long = "renice",
@@ -106,6 +107,7 @@ struct Cli {
         num_args = 0..=1,
         default_missing_value = "19",
         value_parser = clap::value_parser!(i32).range(RENICE_MIN..=RENICE_MAX),
+        verbatim_doc_comment,
     )]
     renice: Option<i32>,
 

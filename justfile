@@ -1,6 +1,9 @@
 
 set dotenv-load
 
+# honour CARGO_TARGET_DIR if set
+target_dir := env("CARGO_TARGET_DIR", "./target")
+
 help:
     @just --list
 
@@ -10,20 +13,21 @@ format:
 build: format
     cargo build
 
-## (cargo build --release) && upx target/release/resource-tracker
+## (cargo build --release) && upx {{target_dir}}/release/resource-tracker
 build_release:  format
 	cargo build --release
 
 install: build_release
-	(mkdir -p ~/bin) && cp -p ./target/release/resource-tracker ~/bin && echo "resource-tracker is now installed in ~/bin"
+	(mkdir -p ~/bin) && cp -p {{target_dir}}/release/resource-tracker ~/bin && echo "resource-tracker is now installed in ~/bin"
 
 run_only_show_key_names:
-     target/release/resource-tracker --interval 3 | jq -r 'paths(scalars) as $p | "\($p | join(".")): \(getpath($p) | type)"'
+     {{target_dir}}/release/resource-tracker --interval 3 | jq -r 'paths(scalars) as $p | "\($p | join(".")): \(getpath($p) | type)"'
 
 # Build mdbook and then cargo doc bundled inside, then open the main page
 document:
     (cd resource-tracker-rs-book && mdbook build) & cargo doc --no-deps --offline --target-dir resource-tracker-rs-book/book/cargo/ & wait
     xdg-open resource-tracker-rs-book/book/index.html &
+
 
 test:
     env -u SENTINEL_API_TOKEN cargo test -- --test-threads=1
@@ -31,17 +35,14 @@ test:
 test_nocapture:
 	env -u SENTINEL_API_TOKEN cargo test -- --test-threads=1 --nocapture
 
-
-
 real_test1: build_release
-	./target/release/resource-tracker  --format csv
+	{{target_dir}}/release/resource-tracker --format csv
 
 real_test2: build_release
-	./target/release/resource-tracker --format csv Rscript stress.r
-
+	{{target_dir}}/release/resource-tracker --format csv Rscript stress.r
 
 real_test3: build_release
-	./target/release/resource-tracker --format csv Rscript stress.r --cpu 4 --vm 1 --vm-bytes 12024M --timeout 63s
+	{{target_dir}}/release/resource-tracker --format csv Rscript stress.r --cpu 4 --vm 1 --vm-bytes 12024M --timeout 63s
 
 
 report_coverage:
@@ -57,14 +58,12 @@ outdated:
 	@command -v cargo-outdated >/dev/null 2>&1 || cargo install cargo-outdated --locked
 	cargo outdated
 
-
 issue_20_test:
     cargo build --examples
-    ./target/debug/resource-tracker --interval 1 -- ./target/debug/examples/repro_cpu_cutime_spike 2>&1 | grep --line-buffered '^{' | jq '{cores_process: .cpu.process_cores_used, cores_system: .cpu.utilization_pct}'
+    {{target_dir}}/debug/resource-tracker --interval 1 -- {{target_dir}}/debug/examples/repro_cpu_cutime_spike 2>&1 | grep --line-buffered '^{' | jq '{cores_process: .cpu.process_cores_used, cores_system: .cpu.utilization_pct}'
 
 issue_20_test2: build_release
-	TRACKER_QUIET=false sudo ./target/release/resource-tracker -o rt.log nice -n -20 python3 run_stressng_benchmarks.py
-
+	TRACKER_QUIET=false sudo {{target_dir}}/release/resource-tracker -o rt.log nice -n -20 python3 run_stressng_benchmarks.py
 
 
 ## Stub for possisble future use:

@@ -157,6 +157,15 @@ impl ResourceTracker {
         }
     }
 
+    fn mask_sensitive_data_in_command(&mut self) {
+
+        for data in &mut self.config.metadata.command {
+            *data = "xxx".to_string();
+        }
+
+        println!("META: {:?}", self.config.metadata);
+    }
+
     fn setup_sentinel(&mut self) {
         self.sentinel = SentinelClient::from_env();
 
@@ -364,6 +373,7 @@ impl ResourceTracker {
         std::thread::sleep(self.interval);
 
         self.spawn_tracked_command();
+        self.mask_sensitive_data_in_command();
         self.setup_sentinel();
         self.emit_csv_header();
         self.renice_tracker();

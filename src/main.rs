@@ -22,6 +22,7 @@ use collector::{
 use config::{Config, OutputFormat};
 use metrics::CloudInfo;
 use metrics::Sample;
+use rune_redact;
 use sentinel::{BatchUploader, RunContext, SentinelClient, close_run, samples_to_csv, start_run};
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -158,12 +159,38 @@ impl ResourceTracker {
     }
 
     fn mask_sensitive_data_in_command(&mut self) {
+        for item in &mut self.config.metadata.command {
+            if let Some(redacted) = Self::try_redact(item) {
+                *item = redacted;
+            }
+        }
+    }
 
-        for data in &mut self.config.metadata.command {
-            *data = "xxx".to_string();
+    fn try_redact(raw: &str) -> Option<String> {
+        // such keys used to be stored in files, but we're watching
+        if raw.starts_with("-----BEGIN") {
+            return Some("[KEY]".to_string());
         }
 
-        println!("META: {:?}", self.config.metadata);
+        // missing rune_redact feature: check for ftp scheme
+        if raw.starts_with("ftp://") {
+            return Self::mask_first_word(raw, "[URL]").into();
+        }
+
+        // missing rune_redact feature: check for URL variables
+        if raw.starts_with("http://") || raw.starts_with("https://") {
+            if !raw.contains(".") || raw.contains("?") || raw.contains("&") || raw.contains("=") {
+                return Self::mask_first_word(raw, "[URL]");
+            }
+        }
+
+        let redacted = rune_redact::redact(raw);
+        (redacted != raw).then_some(redacted)
+    }
+
+    fn mask_first_word(raw: &str, mask: &str) -> Option<String> {
+        let end_pos = raw.find(' ').unwrap_or(raw.len());
+        Some(format!("{}{}", mask, &raw[end_pos..]).to_owned())
     }
 
     fn setup_sentinel(&mut self) {
@@ -540,5 +567,161 @@ mod tests {
         unsafe {
             libc::signal(libc::SIGINT, libc::SIG_DFL);
         }
+    }
+
+    fn test_redact(data: &str, contains: Option<&str>) {
+        let result = ResourceTracker::try_redact(data);
+
+        match (contains, result) {
+            (Some(expected), Some(redacted)) => {
+                assert!(
+                    redacted.contains(expected),
+                    "expected to be redacted, got: {redacted}"
+                );
+            }
+            (Some(_), None) => {
+                panic!("expected to be redacted, but not detected");
+            }
+            (None, Some(redacted)) => {
+                panic!("expected to be unchanged, got {redacted}");
+            }
+            (None, None) => (),
+        }
+    }
+
+    // redact: email
+
+    #[test]
+    fn test_redact_email_plain_good() {
+        test_redact("sample@example.com", Some("[EMAIL]"));
+    }
+
+    #[test]
+    fn test_redact_email_dot_in_username() {
+        test_redact("good.sample@example.com", Some("[EMAIL]"));
+    }
+
+    #[test]
+    fn test_redact_email_twitter_style() {
+        test_redact("@twitternick", None);
+    }
+
+    #[test]
+    fn test_redact_email_invalid_host() {
+        test_redact("nick@invalid_host.com", None);
+    }
+
+    // redact: URL
+
+    #[test]
+    fn test_redact_url_no_tld() {
+        test_redact("http://server04", Some("[URL]")); // reveals local machine name
+    }
+
+    #[test]
+    fn test_redact_url_http() {
+        test_redact("http://example.com", None); // not leaking any information
+    }
+
+    #[test]
+    fn test_redact_url_https() {
+        test_redact("https://example.com/path", None); // innocent
+    }
+
+    #[test]
+    fn test_redact_url_https_with_account() {
+        test_redact("https://nick@example.com/path", Some("[")); // both [URL] and [EMAIL] is okay
+    }
+
+    #[test]
+    fn test_redact_url_with_query_params() {
+        test_redact("https://example.com/page?q=search&lang=en", Some("[URL]"));
+    }
+
+    #[test]
+    fn test_redact_url_with_fragment() {
+        test_redact("https://example.com#section", None); // innocent
+    }
+
+    #[test]
+    fn test_redact_url_with_subdomain() {
+        test_redact("https://api.example.com/report/from/otherworld", None); // innocent
+    }
+
+    #[test]
+    fn test_redact_url_with_port() {
+        test_redact("https://localhost:8080/admin", Some("[URL]"));
+    }
+
+    #[test]
+    fn test_redact_url_ftp() {
+        test_redact("ftp://ftp.example.com/files", Some("[URL]"));
+    }
+
+    #[test]
+    fn test_redact_url_invalid_no_protocol() {
+        test_redact("example.com", None); // not a real URL
+    }
+
+    // redact: IP address
+
+    #[test]
+    fn test_redact_ipv4_standard() {
+        test_redact("192.168.1.1", Some("[IP]"));
+    }
+
+    #[test]
+    fn test_redact_ipv4_with_port() {
+        test_redact("192.168.1.1:8080", Some("[IP]"));
+    }
+
+    #[test]
+    fn test_redact_ipv4_all_zeros() {
+        test_redact("0.0.0.0", Some("[IP]"));
+    }
+
+    #[test]
+    fn test_redact_ipv4_loopback() {
+        test_redact("127.0.0.1", Some("[IP]"));
+    }
+
+    #[test]
+    fn test_redact_ipv4_broadcast() {
+        test_redact("255.255.255.255", Some("[IP]"));
+    }
+
+    #[test]
+    fn test_redact_ip_invalid_octet_overflow() {
+        test_redact("256.168.1.1", None);
+    }
+
+    #[test]
+    fn test_redact_ip_invalid_partial() {
+        test_redact("192.168.1", None);
+    }
+
+    // redact keys
+
+    #[test]
+    fn test_redact_ssl_private_key_rsa() {
+        test_redact(
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA...\n-----END RSA PRIVATE KEY-----",
+            Some("[KEY]"),
+        );
+    }
+
+    #[test]
+    fn test_redact_ssl_cert() {
+        test_redact(
+            "-----BEGIN CERTIFICATE-----\nMIIEowIBAAKCAQEA...\n-----END CERTIFICATE-----",
+            Some("[KEY]"),
+        );
+    }
+
+    // token
+
+    #[test]
+    fn test_redact_possible_token() {
+        test_redact("ar4mNbYrVwZuAtJhCf7DgLeW2oI5qR8eMvXn", Some("[SECRET]"));
     }
 }

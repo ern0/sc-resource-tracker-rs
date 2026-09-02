@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.16] - 2026-09-02
+
+### Mask sensitive data in the logged command
+
+The Tracker now manages the executed program's arguments by scanning them,
+replacing any sensitive data with "[EMAIL]" or "[SECRET]" etc.
+
+Related ticket: [#30](https://github.com/SpareCores/resource-tracker-rs/issues/30)
+
 ## [0.1.15] - 2026-08-09
 
 ### Option for renice resource-tracker process

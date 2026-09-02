@@ -663,6 +663,15 @@ mod tests {
         test_redact("example.com", None); // not a real URL
     }
 
+    #[test]
+    fn test_redact_connection_string() {
+        let raw = "app.py --connection-string 'postgresql://username:ASDAD_32ejae32DWQdw2d2@foobar.db.provider.com:12345/db?sslmode=require'";
+        assert_eq!(
+            ResourceTracker::try_redact(raw).as_deref(),
+            Some("app.py --connection-string [SECRET]")
+        );
+    }
+
     // redact: IP address
 
     #[test]

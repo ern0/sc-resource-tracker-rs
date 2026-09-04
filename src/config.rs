@@ -113,11 +113,12 @@ struct Cli {
     )]
     renice: Option<i32>,
 
-    /// Aggregate CPU steal value
+    /// Aggregate CPU steal value (default: true)
     #[arg(
         long = "aggregate-cpu-steal",
         value_name = "AGGREGATE_CPU_STEAL",
-        env = "TRACKER_AGGREGATE_CPU_STEAL"
+        env = "TRACKER_AGGREGATE_CPU_STEAL",
+        default_missing_value = "true"
     )]
     aggregate_cpu_steal: Option<bool>,
 

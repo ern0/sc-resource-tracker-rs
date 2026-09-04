@@ -44,6 +44,8 @@ struct TomlTracker {
     interval_secs: Option<u64>,
     /// Resource tracker nice value. Default: no change.
     renice: Option<i32>,
+    /// Aggregate CPU steal value. Default: yes.
+    aggregate_cpu_steal: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -110,6 +112,14 @@ struct Cli {
         verbatim_doc_comment,
     )]
     renice: Option<i32>,
+
+    /// Aggregate CPU steal value
+    #[arg(
+        long = "aggregate-cpu-steal",
+        value_name = "AGGREGATE_CPU_STEAL",
+        env = "TRACKER_AGGREGATE_CPU_STEAL"
+    )]
+    aggregate_cpu_steal: Option<bool>,
 
     /// Path to TOML config file.
     #[arg(short = 'c', long, value_name = "FILE", default_value = DEFAULT_CONFIG_FILE)]
@@ -203,6 +213,8 @@ pub struct Config {
     pub interval_secs: u64,
     /// Nice value applied to the tracker process itself (0..=19).
     pub renice: Option<i32>,
+    // CPU steal tracking mode
+    pub aggregate_cpu_steal: bool,
     /// Output format (JSON or CSV).
     pub format: OutputFormat,
     /// Write metric output to this file path instead of stdout.
@@ -242,6 +254,11 @@ impl Config {
             .renice
             .or_else(|| toml.tracker.as_ref().and_then(|t| t.renice));
 
+        let aggregate_cpu_steal = cli
+            .aggregate_cpu_steal
+            .or_else(|| toml.tracker.as_ref().and_then(|t| t.aggregate_cpu_steal))
+            .unwrap_or(true);
+
         let pid = cli.pid.or_else(|| toml.job.as_ref().and_then(|j| j.pid));
 
         let metadata = JobMetadata {
@@ -266,6 +283,7 @@ impl Config {
             pid,
             interval_secs,
             renice,
+            aggregate_cpu_steal,
             format: cli.format,
             output_file: cli.output,
             quiet: cli.quiet,

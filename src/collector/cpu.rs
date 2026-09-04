@@ -323,10 +323,12 @@ pub struct CpuCollector {
     /// interval (their `/proc/PID/stat` read failed).  Limited to one
     /// hop so dead PIDs don't accumulate and inflate the exited correction.
     carried_forward: HashSet<i32>,
+    /// Use aggregated value or per-CPU value. Comes from CLI arg or config.
+    aggregate_cpu_steal: bool,
 }
 
 impl CpuCollector {
-    pub fn new(pid: Option<i32>) -> Self {
+    pub fn new(pid: Option<i32>, aggregate_cpu_steal: bool) -> Self {
         let cpu_source = detect_cpu_source();
         let cfs_quota = detect_cfs_quota();
 
@@ -346,6 +348,7 @@ impl CpuCollector {
             cfs_quota,
             effective_cores,
             carried_forward: HashSet::new(),
+            aggregate_cpu_steal,
         }
     }
 

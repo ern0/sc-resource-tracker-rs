@@ -93,7 +93,7 @@ impl ResourceTracker {
         let out_file = Self::create_sink(&config);
         let interval = Duration::from_secs(config.interval_secs);
 
-        let cpu = CpuCollector::new(config.pid);
+        let cpu = CpuCollector::new(config.pid, config.aggregate_cpu_steal);
         let memory = MemoryCollector::new();
         let network = NetworkCollector::new();
         let disk = DiskCollector::new(interval);

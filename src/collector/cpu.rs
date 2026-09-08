@@ -468,6 +468,9 @@ impl CpuCollector {
             per_core_pct: vec![0.0; curr.per_core.len()],
             utime_secs: 0.0,
             stime_secs: 0.0,
+            steal_time_secs: 0.0,
+            steal_time_pct: 0.0,
+            per_core_steal_time_pct: vec![0.0; curr.per_core.len()],
             process_count,
             process_cores_used: self.pid.map(|_| 0.0),
             process_child_count: self
@@ -507,6 +510,15 @@ impl CpuCollector {
 
         let process_utime_secs = self.calculate_process_utime_delta(prev, curr, exited_utime, tps);
         let process_stime_secs = self.calculate_process_stime_delta(prev, curr, exited_stime, tps);
+
+        let steal_time_secs = self.calculate_steal_time_secs(prev, curr, tps);
+        let steal_time_pct = self.calculate_steal_time_pct(prev, curr);
+        let per_core_steal_time_pct = if self.aggregate_cpu_steal {
+            vec![]
+        } else {
+            self.calculate_per_core_steal_pct(prev, curr)
+        };
+
         let process_cores_used = self.calculate_process_cores_used_with_caps(
             &process_utime_secs,
             &process_stime_secs,
@@ -526,6 +538,9 @@ impl CpuCollector {
             per_core_pct,
             utime_secs,
             stime_secs,
+            steal_time_secs,
+            steal_time_pct,
+            per_core_steal_time_pct,
             process_count,
             process_cores_used,
             process_child_count: self
@@ -647,6 +662,51 @@ impl CpuCollector {
         };
 
         Some(adjusted as f64 / tps)
+    }
+
+    fn calculate_steal_time_secs(&self, prev: &Snapshot, curr: &Snapshot, tps: f64) -> f64 {
+        let curr_steal = curr.total.steal.unwrap_or(0);
+        let prev_steal = prev.total.steal.unwrap_or(0);
+
+        curr_steal.saturating_sub(prev_steal) as f64 / tps
+    }
+
+    fn calculate_steal_time_pct(&self, prev: &Snapshot, curr: &Snapshot) -> f64 {
+        let prev_total = cpu_total(&prev.total);
+        let curr_total = cpu_total(&curr.total);
+        let prev_steal = prev.total.steal.unwrap_or(0);
+        let curr_steal = curr.total.steal.unwrap_or(0);
+
+        let delta_total = curr_total.saturating_sub(prev_total) as f64;
+        let delta_steal = curr_steal.saturating_sub(prev_steal) as f64;
+
+        if delta_total == 0.0 {
+            0.0
+        } else {
+            (delta_steal / delta_total * 100.0).clamp(0.0, 100.0)
+        }
+    }
+
+    fn calculate_per_core_steal_pct(&self, prev: &Snapshot, curr: &Snapshot) -> Vec<f64> {
+        prev.per_core
+            .iter()
+            .zip(curr.per_core.iter())
+            .map(|(p, c)| {
+                let p_total = cpu_total(p);
+                let c_total = cpu_total(c);
+                let p_steal = p.steal.unwrap_or(0);
+                let c_steal = c.steal.unwrap_or(0);
+
+                let delta_total = c_total.saturating_sub(p_total) as f64;
+                let delta_steal = c_steal.saturating_sub(p_steal) as f64;
+
+                if delta_total == 0.0 {
+                    0.0
+                } else {
+                    (delta_steal / delta_total * 100.0).clamp(0.0, 100.0)
+                }
+            })
+            .collect()
     }
 
     fn calculate_process_cores_used_with_caps(
@@ -802,7 +862,7 @@ mod tests {
     // sleep then a second collect() produces real data.
     #[test]
     fn test_first_collect_returns_zero_for_delta_fields() {
-        let mut collector = CpuCollector::new(None);
+        let mut collector = CpuCollector::new(None, false);
         let metrics = collector.collect().expect("first collect failed");
         assert_eq!(
             metrics.utilization_pct, 0.0,
@@ -830,7 +890,7 @@ mod tests {
     #[test]
     fn test_first_collect_with_pid_returns_some_process_fields() {
         let pid = i32::try_from(std::process::id()).expect("PID too large");
-        let mut collector = CpuCollector::new(Some(pid));
+        let mut collector = CpuCollector::new(Some(pid), false);
         let m = collector.collect().expect("collect() failed");
         assert!(
             m.process_cores_used.is_some(),
@@ -903,7 +963,7 @@ mod tests {
     #[test]
     fn test_second_collect_with_pid_nonneg_cores() {
         let pid = i32::try_from(std::process::id()).expect("PID too large");
-        let mut collector = CpuCollector::new(Some(pid));
+        let mut collector = CpuCollector::new(Some(pid), false);
         let _ = collector.collect().expect("first collect() failed");
         let m = collector.collect().expect("second collect() failed");
         let cores = m
@@ -918,7 +978,7 @@ mod tests {
     // T-CPU-11: second collect() with no PID still returns None for all process fields.
     #[test]
     fn test_second_collect_no_pid_all_process_fields_none() {
-        let mut collector = CpuCollector::new(None);
+        let mut collector = CpuCollector::new(None, false);
         let _ = collector.collect().expect("first collect() failed");
         let m = collector.collect().expect("second collect() failed");
         assert!(
@@ -958,7 +1018,7 @@ mod tests {
     // T-CPU-12: process_count > 0 (at least one process is always visible).
     #[test]
     fn test_process_count_positive() {
-        let mut collector = CpuCollector::new(None);
+        let mut collector = CpuCollector::new(None, false);
         let m = collector.collect().expect("collect() failed");
         assert!(
             m.process_count > 0,
@@ -1094,7 +1154,7 @@ mod tests {
     #[test]
     fn test_process_cores_used_does_not_exceed_system_utilization() {
         let pid = i32::try_from(std::process::id()).expect("PID too large");
-        let mut collector = CpuCollector::new(Some(pid));
+        let mut collector = CpuCollector::new(Some(pid), false);
 
         // Spawn a CPU-busy child to simulate a long-running process on a
         // busy server.  A shell busy-loop accumulates real utime ticks.
@@ -1152,7 +1212,7 @@ mod tests {
     #[test]
     fn test_process_utime_no_double_count_after_child_exits() {
         let pid = i32::try_from(std::process::id()).expect("PID too large");
-        let mut collector = CpuCollector::new(Some(pid));
+        let mut collector = CpuCollector::new(Some(pid), false);
 
         // Spawn a child that burns a little CPU then exits naturally.
         // `sh` must be available on any Linux host used for testing.
@@ -1209,7 +1269,7 @@ mod tests {
     #[test]
     fn test_cutime_correction_multi_interval_child_exit() {
         let pid = i32::try_from(std::process::id()).expect("PID too large");
-        let mut collector = CpuCollector::new(Some(pid));
+        let mut collector = CpuCollector::new(Some(pid), false);
 
         // Spawn a CPU-busy child that accumulates real utime ticks.
         let mut child = std::process::Command::new("sh")

@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.1.16] - 2026-09-08
+
+### Tracking of CPU steal time
+
+The Tracker now captures steal time
+(from the 8th field in `/proc/stat` CPU-related records)
+and reports it in seconds and as a percentage.
+
+The Tracker defaults to aggregated collection, which can be changed
+by CLI flag `--aggregate-cpu-steal` or
+environment variable `AGGREGATE_CPU_STEAL`.
+
+Due to the format constraints, CSV output mode only reports
+aggregated value of steal time secs.
+
+Related ticket: [#34](https://github.com/SpareCores/resource-tracker-rs/issues/34)
+
+### Refactoring of [`cpu.rs`](src/cpu.rs)
+
+Exploded 300-line long `CpuCollector::collect()` function to small ones.
+
 ## [0.1.15] - 2026-08-09
 
 ### Option for renice resource-tracker process

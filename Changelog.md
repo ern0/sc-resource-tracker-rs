@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.1.16] - 2026-09-08
+## [0.1.16] - 2026-09-09
 
 ### Tracking of CPU steal time
 
@@ -8,12 +8,11 @@ The Tracker now captures steal time
 (from the 8th field in `/proc/stat` CPU-related records)
 and reports it in seconds and as a percentage.
 
-The Tracker defaults to aggregated collection, which can be changed
-by CLI flag `--aggregate-cpu-steal` or
-environment variable `AGGREGATE_CPU_STEAL`.
+The Tracker defaults to aggregated collection, which can be changed by
+CLI flag `--aggregate-cpu-steal` or environment variable `AGGREGATE_CPU_STEAL`.
+Due to the format constraints, CSV output mode only reports aggregated value.
 
-Due to the format constraints, CSV output mode only reports
-aggregated value of steal time secs.
+Note: A new column has been added to the end of the CSV output line.
 
 Related ticket: [#34](https://github.com/SpareCores/resource-tracker-rs/issues/34)
 

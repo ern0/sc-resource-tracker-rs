@@ -144,7 +144,7 @@ pub fn sample_to_csv_row(s: &Sample, interval_secs: u64) -> String {
     ]
     .join(",");
 
-    format!("{system_row},{process_row},{}", s.cpu.steal_time_secs)
+    format!("{system_row},{process_row},{:.3}", s.cpu.steal_time_secs)
 }
 
 // ---------------------------------------------------------------------------

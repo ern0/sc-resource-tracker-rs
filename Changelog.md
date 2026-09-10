@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.1.16] - 2026-09-09
+## [0.1.17] - 2026-09-10
 
 ### Tracking of CPU steal time
 
@@ -16,9 +16,18 @@ Note: A new column has been added to the end of the CSV output line.
 
 Related ticket: [#34](https://github.com/SpareCores/resource-tracker-rs/issues/34)
 
-### Refactoring of [`cpu.rs`](src/cpu.rs)
+### Refactoring of [`collector/cpu.rs`](src/collector/cpu.rs)
 
 Exploded 300-line long `CpuCollector::collect()` function to small ones.
+
+## [0.1.16] - 2026-09-02
+
+### Mask sensitive data in the logged command
+
+The Tracker now manages the executed program's arguments by scanning them,
+replacing any sensitive data with "[EMAIL]" or "[SECRET]" etc.
+
+Related ticket: [#30](https://github.com/SpareCores/resource-tracker-rs/issues/30)
 
 ## [0.1.15] - 2026-08-09
 

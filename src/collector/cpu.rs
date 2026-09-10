@@ -470,7 +470,11 @@ impl CpuCollector {
             stime_secs: 0.0,
             steal_time_secs: 0.0,
             steal_time_pct: 0.0,
-            per_core_steal_time_pct: vec![0.0; curr.per_core.len()],
+            per_core_steal_time_pct: if self.aggregate_cpu_steal {
+                vec![]
+            } else {
+                vec![0.0; curr.per_core.len()]
+            },
             process_count,
             process_cores_used: self.pid.map(|_| 0.0),
             process_child_count: self

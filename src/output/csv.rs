@@ -25,7 +25,8 @@ pub fn csv_header() -> &'static str {
      system_gpu_usage,system_gpu_vram_mib,system_gpu_utilized,\
      process_pid,process_children,process_utime,process_stime,process_cpu_usage,\
      process_memory_mib,process_disk_read_bytes,process_disk_write_bytes,\
-     process_gpu_usage,process_gpu_vram_mib,process_gpu_utilized"
+     process_gpu_usage,process_gpu_vram_mib,process_gpu_utilized,\
+     system_steal_time"
 }
 
 /// Serialize a `Sample` as a single CSV row (no newline).
@@ -143,7 +144,7 @@ pub fn sample_to_csv_row(s: &Sample, interval_secs: u64) -> String {
     ]
     .join(",");
 
-    format!("{system_row},{process_row}")
+    format!("{system_row},{process_row},{:.3}", s.cpu.steal_time_secs)
 }
 
 // ---------------------------------------------------------------------------
@@ -167,6 +168,9 @@ mod tests {
                 cgroup_usage_secs: None,
                 utime_secs: 1.234,
                 stime_secs: 0.567,
+                steal_time_secs: 0.0,
+                steal_time_pct: 0.0,
+                per_core_steal_time_pct: vec![],
                 process_count: 42,
                 per_core_pct: vec![],
                 process_cores_used: None,

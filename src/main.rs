@@ -94,7 +94,10 @@ impl ResourceTracker {
         let out_file = Self::create_sink(&config);
         let interval = Duration::from_secs(config.interval_secs);
 
-        let cpu = CpuCollector::new(config.pid);
+        // The CSV schema only has a column for aggregate steal time
+        let aggregate_cpu_steal = config.aggregate_cpu_steal || config.format == OutputFormat::Csv;
+
+        let cpu = CpuCollector::new(config.pid, aggregate_cpu_steal);
         let memory = MemoryCollector::new();
         let network = NetworkCollector::new();
         let disk = DiskCollector::new(interval);

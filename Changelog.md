@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.1.17] - 2026-09-10
+
+### Tracking of CPU steal time
+
+The Tracker now captures steal time
+(from the 8th field in `/proc/stat` CPU-related records)
+and reports it in seconds and as a percentage.
+
+The Tracker defaults to aggregated collection, which can be changed by
+CLI flag `--aggregate-cpu-steal` or environment variable `TRACKER_AGGREGATE_CPU_STEAL`.
+Due to the format constraints, CSV output mode only reports aggregated value.
+
+Note: A new column has been added to the end of the CSV output line.
+
+Related ticket: [#34](https://github.com/SpareCores/resource-tracker-rs/issues/34)
+
+### Refactoring of [`collector/cpu.rs`](src/collector/cpu.rs)
+
+Exploded 300-line long `CpuCollector::collect()` function to small ones.
+
 ## [0.1.16] - 2026-09-02
 
 ### Mask sensitive data in the logged command

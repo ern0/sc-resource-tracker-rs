@@ -323,10 +323,12 @@ pub struct CpuCollector {
     /// interval (their `/proc/PID/stat` read failed).  Limited to one
     /// hop so dead PIDs don't accumulate and inflate the exited correction.
     carried_forward: HashSet<i32>,
+    /// Use aggregated value or per-CPU value. Comes from CLI arg or config.
+    aggregate_cpu_steal: bool,
 }
 
 impl CpuCollector {
-    pub fn new(pid: Option<i32>) -> Self {
+    pub fn new(pid: Option<i32>, aggregate_cpu_steal: bool) -> Self {
         let cpu_source = detect_cpu_source();
         let cfs_quota = detect_cfs_quota();
 
@@ -346,6 +348,7 @@ impl CpuCollector {
             cfs_quota,
             effective_cores,
             carried_forward: HashSet::new(),
+            aggregate_cpu_steal,
         }
     }
 
@@ -356,58 +359,16 @@ impl CpuCollector {
 
     pub fn collect(&mut self) -> Result<CpuMetrics> {
         let tps = procfs::ticks_per_second() as f64;
+        let process_count = self.read_process_count();
 
-        let process_count = std::fs::read_dir("/proc")
-            .map(|dir| {
-                let n = dir
-                    .filter_map(|e| e.ok())
-                    .filter(|e| {
-                        e.file_name()
-                            .to_string_lossy()
-                            .chars()
-                            .all(|c| c.is_ascii_digit())
-                    })
-                    .count();
-                u32::try_from(n).unwrap_or(0)
-            })
-            .unwrap_or(0);
-
-        // --- FIXED ORDER: read system-level stats FIRST, then process tree ---
-        // This ensures that any ticks accumulated by the process between the
-        // system read and the process read are counted in BOTH, making it
-        // impossible for process to exceed system due to read ordering.
-
-        // 1. Read system /proc/stat (always needed for per-core and fallback).
+        // Read system and process data in correct order
         let stats = KernelStats::current()?;
-
-        // 2. Read cgroup CPU usage (if available).
         let cgroup_usage_secs = read_cgroup_usage_secs(self.cpu_source);
-
-        // 3. NOW read process tree ticks (after system, so process ⊆ system).
-        let proc_ticks = match self.pid {
-            Some(root) => process_tree_ticks(root),
-            None => HashMap::new(),
-        };
-
-        // 4. Record wall-clock time AFTER all reads share the same endpoint.
+        let proc_ticks = self.read_process_ticks();
         let now = Instant::now();
 
-        // Read process I/O and memory only when tracking a PID.
-        let proc_io = if self.pid.is_some() {
-            let pids: Vec<i32> = proc_ticks.keys().copied().collect();
-            process_tree_io(&pids)
-        } else {
-            HashMap::new()
-        };
-
-        // Process memory is instantaneous (not a delta), compute before storing prev.
-        let (process_pss_mib, process_rss_mib) = if self.pid.is_some() {
-            let pids: Vec<i32> = proc_ticks.keys().copied().collect();
-            let (pss, rss) = process_tree_memory_mib(&pids);
-            (Some(pss), Some(rss))
-        } else {
-            (None, None)
-        };
+        let proc_io = self.read_process_io(&proc_ticks);
+        let (process_pss_mib, process_rss_mib) = self.read_process_memory(&proc_ticks);
 
         let mut curr = Snapshot {
             total: stats.total,
@@ -419,237 +380,418 @@ impl CpuCollector {
         };
 
         let metrics = match &self.prev {
-            // First call: store baseline and return zeros. The caller should
-            // sleep for one interval then call collect() again for real data.
-            None => CpuMetrics {
-                utilization_pct: 0.0,
-                cgroup_utilization_pct: curr
-                    .cgroup_usage_secs
-                    .filter(|_| self.cpu_source.is_cgroup())
-                    .map(|_| 0.0),
-                cgroup_usage_secs: curr
-                    .cgroup_usage_secs
-                    .filter(|_| self.cpu_source.is_cgroup())
-                    .map(|_| 0.0),
-                per_core_pct: vec![0.0; curr.per_core.len()],
-                utime_secs: 0.0,
-                stime_secs: 0.0,
+            None => {
+                self.build_first_metrics(&curr, process_count, process_pss_mib, process_rss_mib)
+            }
+            Some(prev) => self.build_subsequent_metrics_with_deltas(
+                prev,
+                &mut curr,
                 process_count,
-                process_cores_used: self.pid.map(|_| 0.0),
-                process_child_count: self
-                    .pid
-                    .map(|_| u32::try_from(curr.proc_ticks.len().saturating_sub(1)).unwrap_or(0)),
-                process_utime_secs: self.pid.map(|_| 0.0),
-                process_stime_secs: self.pid.map(|_| 0.0),
+                tps,
                 process_pss_mib,
                 process_rss_mib,
-                process_disk_read_bytes: self.pid.map(|_| 0),
-                process_disk_write_bytes: self.pid.map(|_| 0),
-                process_gpu_usage: None, // filled by main.rs after GPU query
-                process_gpu_vram_mib: None, // filled by main.rs after GPU query
-                process_gpu_utilized: None,
-                process_tree_pids: curr.proc_ticks.keys().copied().collect(),
-            },
-
-            Some(prev) => {
-                let n_cores = curr.per_core.len();
-                let elapsed = (curr.instant - prev.instant).as_secs_f64().max(0.001);
-
-                // Per-interval CPU time deltas - matches Python resource-tracker's
-                // utime/stime columns (delta ticks / ticks_per_second).
-                let utime_secs = (curr.total.user + curr.total.nice)
-                    .saturating_sub(prev.total.user + prev.total.nice)
-                    as f64
-                    / tps;
-                let stime_secs = curr.total.system.saturating_sub(prev.total.system) as f64 / tps;
-
-                let per_core_pct = prev
-                    .per_core
-                    .iter()
-                    .zip(curr.per_core.iter())
-                    .map(|(p, c)| core_util_pct(p, c))
-                    .collect();
-
-                // Keep utilization_pct host-scoped:
-                // /proc/stat aggregate busy ratio scaled by host core count.
-                let utilization_pct = aggregate_util_cores(&prev.total, &curr.total, n_cores);
-
-                // Expose container/cgroup CPU usage separately when available.
-                let (cgroup_usage_secs, cgroup_utilization_pct) =
-                    match (curr.cgroup_usage_secs, prev.cgroup_usage_secs) {
-                        (Some(curr_cg), Some(prev_cg)) => {
-                            let delta = (curr_cg - prev_cg).max(0.0);
-                            let cores_used = delta / elapsed;
-                            (Some(delta), Some(cores_used.min(self.effective_cores)))
-                        }
-                        _ => (None, None),
-                    };
-
-                // Cutime double-counting correction (issue #20).
-                //
-                // When a child exits and is reaped, its full-lifetime ticks
-                // roll into the parent's cutime.  The child's pre-snapshot
-                // portion is already counted via its prev entry, so we
-                // subtract it to avoid double-counting.
-                //
-                // Safety: if exited_ticks > raw_delta, the "exits" are
-                // likely transient /proc scan failures (the parent's cutime
-                // didn't actually increase).  In that case the correction
-                // is skipped to avoid flooring the result to zero.
-                let (exited_utime, exited_stime): (u64, u64) = if self.pid.is_some() {
-                    prev.proc_ticks
-                        .iter()
-                        .filter(|(pid, _)| !curr.proc_ticks.contains_key(pid))
-                        .fold((0u64, 0u64), |(au, as_), (_, &(pu, ps))| {
-                            (au + pu, as_ + ps)
-                        })
-                } else {
-                    (0, 0)
-                };
-
-                let process_child_count = self
-                    .pid
-                    .map(|_| u32::try_from(curr.proc_ticks.len().saturating_sub(1)).unwrap_or(0));
-
-                // Per-tree utime and stime deltas (seconds this interval).
-                let process_utime_secs = self.pid.map(|_| {
-                    let raw: u64 = curr
-                        .proc_ticks
-                        .iter()
-                        .map(|(pid, &(cu, _))| {
-                            let pu = prev.proc_ticks.get(pid).map(|&(u, _)| u).unwrap_or(cu);
-                            cu.saturating_sub(pu)
-                        })
-                        .sum();
-                    if exited_utime <= raw {
-                        (raw - exited_utime) as f64 / tps
-                    } else {
-                        raw as f64 / tps
-                    }
-                });
-
-                let process_stime_secs = self.pid.map(|_| {
-                    let raw: u64 = curr
-                        .proc_ticks
-                        .iter()
-                        .map(|(pid, &(_, cs))| {
-                            let ps = prev.proc_ticks.get(pid).map(|&(_, s)| s).unwrap_or(cs);
-                            cs.saturating_sub(ps)
-                        })
-                        .sum();
-                    if exited_stime <= raw {
-                        (raw - exited_stime) as f64 / tps
-                    } else {
-                        raw as f64 / tps
-                    }
-                });
-
-                // --- CAPPED process_cores_used ---
-                // Primary: tick-seconds / wall-elapsed (as before).
-                // Then apply two caps to prevent impossible values:
-                //   1. System tick-ratio cap: process can't exceed total system CPU
-                //   2. CFS quota cap: process can't exceed its allowed quota
-                let process_cores_used = match (self.pid, process_utime_secs, process_stime_secs) {
-                    (Some(_), Some(u), Some(s)) => {
-                        let raw_cores = ((u + s) / elapsed).max(0.0);
-
-                        // Cap 1: tick-ratio bound — process ticks can't exceed
-                        // total system ticks (both from same kernel accounting).
-                        // Uses /proc/stat total ticks as the authoritative ceiling.
-                        let sys_total_delta =
-                            cpu_total(&curr.total).saturating_sub(cpu_total(&prev.total));
-                        let sys_idle_delta =
-                            cpu_idle(&curr.total).saturating_sub(cpu_idle(&prev.total));
-                        let sys_busy_secs = if sys_total_delta > 0 {
-                            (sys_total_delta - sys_idle_delta.min(sys_total_delta)) as f64 / tps
-                        } else {
-                            f64::MAX
-                        };
-                        let tick_ratio_cap = sys_busy_secs / elapsed;
-
-                        // Cap 2: CFS quota — hard limit on what the cgroup allows.
-                        let quota_cap = self.cfs_quota.max_cores.unwrap_or(n_cores as f64);
-
-                        // Apply both caps (take the tightest constraint).
-                        let capped = raw_cores.min(tick_ratio_cap).min(quota_cap);
-
-                        Some(capped)
-                    }
-                    _ => None,
-                };
-
-                // Per-interval disk I/O deltas across the process tree.
-                let process_disk_read_bytes = self.pid.map(|_| {
-                    curr.proc_io
-                        .iter()
-                        .map(|(pid, &(cr, _))| {
-                            let pr = prev.proc_io.get(pid).map(|&(r, _)| r).unwrap_or(cr);
-                            cr.saturating_sub(pr)
-                        })
-                        .sum::<u64>()
-                });
-
-                let process_disk_write_bytes = self.pid.map(|_| {
-                    curr.proc_io
-                        .iter()
-                        .map(|(pid, &(_, cw))| {
-                            let pw = prev.proc_io.get(pid).map(|&(_, w)| w).unwrap_or(cw);
-                            cw.saturating_sub(pw)
-                        })
-                        .sum::<u64>()
-                });
-
-                CpuMetrics {
-                    utilization_pct,
-                    cgroup_utilization_pct,
-                    cgroup_usage_secs,
-                    per_core_pct,
-                    utime_secs,
-                    stime_secs,
-                    process_count,
-                    process_cores_used,
-                    process_child_count,
-                    process_utime_secs,
-                    process_stime_secs,
-                    process_pss_mib,
-                    process_rss_mib,
-                    process_disk_read_bytes,
-                    process_disk_write_bytes,
-                    process_gpu_usage: None, // filled by main.rs after GPU query
-                    process_gpu_vram_mib: None, // filled by main.rs after GPU query
-                    process_gpu_utilized: None,
-                    process_tree_pids: curr.proc_ticks.keys().copied().collect(),
-                }
-            }
+            ),
         };
 
-        // Carry forward: preserve prev entries for PIDs that disappeared from
-        // the live /proc scan.  A missing PID usually indicates a transient
-        // stat() read failure, not a genuine exit.  By inserting its last-known
-        // ticks into the stored snapshot, a reappearing PID computes a correct
-        // delta spanning the gap instead of being treated as "new" (delta = 0).
-        //
-        // Limited to one hop: PIDs already carried forward from the previous
-        // interval are not carried again, preventing dead PIDs from
-        // accumulating indefinitely and inflating the exited correction.
+        self.carry_forward_entries(&mut curr);
+        self.prev = Some(curr);
+        Ok(metrics)
+    }
+
+    fn read_process_count(&self) -> u32 {
+        let Ok(proc_dir) = std::fs::read_dir("/proc") else {
+            return 0;
+        };
+
+        let process_count = proc_dir
+            .filter_map(|entry| entry.ok())
+            .filter(|e| Self::is_pid_directory(e))
+            .count();
+
+        u32::try_from(process_count).unwrap_or(0)
+    }
+
+    fn is_pid_directory(entry: &std::fs::DirEntry) -> bool {
+        entry
+            .file_name()
+            .to_string_lossy()
+            .chars()
+            .all(|c| c.is_ascii_digit())
+    }
+
+    fn read_process_ticks(&self) -> HashMap<i32, (u64, u64)> {
+        match self.pid {
+            Some(root) => process_tree_ticks(root),
+            None => HashMap::new(),
+        }
+    }
+
+    fn read_process_io(&self, proc_ticks: &HashMap<i32, (u64, u64)>) -> HashMap<i32, (u64, u64)> {
+        if self.pid.is_some() {
+            let pids: Vec<i32> = proc_ticks.keys().copied().collect();
+            process_tree_io(&pids)
+        } else {
+            HashMap::new()
+        }
+    }
+
+    fn read_process_memory(
+        &self,
+        proc_ticks: &HashMap<i32, (u64, u64)>,
+    ) -> (Option<u64>, Option<u64>) {
+        if self.pid.is_some() {
+            let pids: Vec<i32> = proc_ticks.keys().copied().collect();
+            let (pss, rss) = process_tree_memory_mib(&pids);
+            (Some(pss), Some(rss))
+        } else {
+            (None, None)
+        }
+    }
+
+    fn build_first_metrics(
+        &self,
+        curr: &Snapshot,
+        process_count: u32,
+        process_pss_mib: Option<u64>,
+        process_rss_mib: Option<u64>,
+    ) -> CpuMetrics {
+        CpuMetrics {
+            utilization_pct: 0.0,
+            cgroup_utilization_pct: curr
+                .cgroup_usage_secs
+                .filter(|_| self.cpu_source.is_cgroup())
+                .map(|_| 0.0),
+            cgroup_usage_secs: curr
+                .cgroup_usage_secs
+                .filter(|_| self.cpu_source.is_cgroup())
+                .map(|_| 0.0),
+            per_core_pct: vec![0.0; curr.per_core.len()],
+            utime_secs: 0.0,
+            stime_secs: 0.0,
+            steal_time_secs: 0.0,
+            steal_time_pct: 0.0,
+            per_core_steal_time_pct: if self.aggregate_cpu_steal {
+                vec![]
+            } else {
+                vec![0.0; curr.per_core.len()]
+            },
+            process_count,
+            process_cores_used: self.pid.map(|_| 0.0),
+            process_child_count: self
+                .pid
+                .map(|_| u32::try_from(curr.proc_ticks.len().saturating_sub(1)).unwrap_or(0)),
+            process_utime_secs: self.pid.map(|_| 0.0),
+            process_stime_secs: self.pid.map(|_| 0.0),
+            process_pss_mib,
+            process_rss_mib,
+            process_disk_read_bytes: self.pid.map(|_| 0),
+            process_disk_write_bytes: self.pid.map(|_| 0),
+            process_gpu_usage: None,
+            process_gpu_vram_mib: None,
+            process_gpu_utilized: None,
+            process_tree_pids: curr.proc_ticks.keys().copied().collect(),
+        }
+    }
+
+    fn build_subsequent_metrics_with_deltas(
+        &self,
+        prev: &Snapshot,
+        curr: &mut Snapshot,
+        process_count: u32,
+        tps: f64,
+        process_pss_mib: Option<u64>,
+        process_rss_mib: Option<u64>,
+    ) -> CpuMetrics {
+        let n_cores = curr.per_core.len();
+        let elapsed = (curr.instant - prev.instant).as_secs_f64().max(0.001);
+
+        let (utime_secs, stime_secs) = self.calculate_system_cpu_deltas(prev, curr, tps);
+        let per_core_pct = self.calculate_per_core_utilization(prev, curr);
+        let utilization_pct = aggregate_util_cores(&prev.total, &curr.total, n_cores);
+        let (cgroup_usage_secs, cgroup_utilization_pct) =
+            self.calculate_cgroup_usage(prev, curr, elapsed);
+        let (exited_utime, exited_stime) = self.calculate_exited_child_ticks(prev, curr);
+
+        let process_utime_secs = self.calculate_process_utime_delta(prev, curr, exited_utime, tps);
+        let process_stime_secs = self.calculate_process_stime_delta(prev, curr, exited_stime, tps);
+
+        let steal_time_secs = self.calculate_steal_time_secs(prev, curr, tps);
+        let steal_time_pct = self.calculate_steal_time_pct(prev, curr);
+        let per_core_steal_time_pct = if self.aggregate_cpu_steal {
+            vec![]
+        } else {
+            self.calculate_per_core_steal_pct(prev, curr)
+        };
+
+        let process_cores_used = self.calculate_process_cores_used_with_caps(
+            &process_utime_secs,
+            &process_stime_secs,
+            prev,
+            curr,
+            elapsed,
+            n_cores,
+        );
+
+        let process_disk_read_bytes = self.calculate_disk_read_delta(prev, curr);
+        let process_disk_write_bytes = self.calculate_disk_write_delta(prev, curr);
+
+        CpuMetrics {
+            utilization_pct,
+            cgroup_utilization_pct,
+            cgroup_usage_secs,
+            per_core_pct,
+            utime_secs,
+            stime_secs,
+            steal_time_secs,
+            steal_time_pct,
+            per_core_steal_time_pct,
+            process_count,
+            process_cores_used,
+            process_child_count: self
+                .pid
+                .map(|_| u32::try_from(curr.proc_ticks.len().saturating_sub(1)).unwrap_or(0)),
+            process_utime_secs,
+            process_stime_secs,
+            process_pss_mib,
+            process_rss_mib,
+            process_disk_read_bytes,
+            process_disk_write_bytes,
+            process_gpu_usage: None,
+            process_gpu_vram_mib: None,
+            process_gpu_utilized: None,
+            process_tree_pids: curr.proc_ticks.keys().copied().collect(),
+        }
+    }
+
+    fn calculate_system_cpu_deltas(
+        &self,
+        prev: &Snapshot,
+        curr: &Snapshot,
+        tps: f64,
+    ) -> (f64, f64) {
+        let utime_secs = (curr.total.user + curr.total.nice)
+            .saturating_sub(prev.total.user + prev.total.nice) as f64
+            / tps;
+        let stime_secs = curr.total.system.saturating_sub(prev.total.system) as f64 / tps;
+        (utime_secs, stime_secs)
+    }
+
+    fn calculate_per_core_utilization(&self, prev: &Snapshot, curr: &Snapshot) -> Vec<f64> {
+        prev.per_core
+            .iter()
+            .zip(curr.per_core.iter())
+            .map(|(p, c)| core_util_pct(p, c))
+            .collect()
+    }
+
+    fn calculate_cgroup_usage(
+        &self,
+        prev: &Snapshot,
+        curr: &Snapshot,
+        elapsed: f64,
+    ) -> (Option<f64>, Option<f64>) {
+        match (curr.cgroup_usage_secs, prev.cgroup_usage_secs) {
+            (Some(curr_cg), Some(prev_cg)) => {
+                let delta = (curr_cg - prev_cg).max(0.0);
+                let cores_used = delta / elapsed;
+                (Some(delta), Some(cores_used.min(self.effective_cores)))
+            }
+            _ => (None, None),
+        }
+    }
+
+    // Calculate exited child ticks for double-counting correction
+    fn calculate_exited_child_ticks(&self, prev: &Snapshot, curr: &Snapshot) -> (u64, u64) {
+        if self.pid.is_none() {
+            return (0, 0);
+        }
+
+        prev.proc_ticks
+            .iter()
+            .filter(|(pid, _)| !curr.proc_ticks.contains_key(*pid))
+            .fold((0, 0), |(user_sum, sys_sum), (_, &(user, sys))| {
+                (user_sum + user, sys_sum + sys)
+            })
+    }
+    fn calculate_process_utime_delta(
+        &self,
+        prev: &Snapshot,
+        curr: &Snapshot,
+        exited_utime: u64,
+        tps: f64,
+    ) -> Option<f64> {
+        if self.pid.is_none() {
+            return None;
+        }
+
+        let raw: u64 = curr
+            .proc_ticks
+            .iter()
+            .map(|(pid, &(cu, _))| {
+                let pu = prev.proc_ticks.get(pid).map(|&(u, _)| u).unwrap_or(cu);
+                cu.saturating_sub(pu)
+            })
+            .sum();
+
+        let adjusted = if exited_utime <= raw {
+            raw - exited_utime
+        } else {
+            raw
+        };
+
+        Some(adjusted as f64 / tps)
+    }
+
+    fn calculate_process_stime_delta(
+        &self,
+        prev: &Snapshot,
+        curr: &Snapshot,
+        exited_stime: u64,
+        tps: f64,
+    ) -> Option<f64> {
+        if self.pid.is_none() {
+            return None;
+        }
+
+        let mut raw: u64 = 0;
+        for (pid, &(_, cs)) in &curr.proc_ticks {
+            let ps = prev.proc_ticks.get(pid).map(|&(_, s)| s).unwrap_or(cs);
+            raw += cs.saturating_sub(ps);
+        }
+
+        let adjusted = if exited_stime <= raw {
+            raw - exited_stime
+        } else {
+            raw
+        };
+
+        Some(adjusted as f64 / tps)
+    }
+
+    fn calculate_steal_time_secs(&self, prev: &Snapshot, curr: &Snapshot, tps: f64) -> f64 {
+        let curr_steal = curr.total.steal.unwrap_or(0);
+        let prev_steal = prev.total.steal.unwrap_or(0);
+
+        curr_steal.saturating_sub(prev_steal) as f64 / tps
+    }
+
+    fn calculate_steal_time_pct(&self, prev: &Snapshot, curr: &Snapshot) -> f64 {
+        let prev_total = cpu_total(&prev.total);
+        let curr_total = cpu_total(&curr.total);
+        let prev_steal = prev.total.steal.unwrap_or(0);
+        let curr_steal = curr.total.steal.unwrap_or(0);
+
+        let delta_total = curr_total.saturating_sub(prev_total) as f64;
+        let delta_steal = curr_steal.saturating_sub(prev_steal) as f64;
+
+        if delta_total == 0.0 {
+            0.0
+        } else {
+            (delta_steal / delta_total * 100.0).clamp(0.0, 100.0)
+        }
+    }
+
+    fn calculate_per_core_steal_pct(&self, prev: &Snapshot, curr: &Snapshot) -> Vec<f64> {
+        prev.per_core
+            .iter()
+            .zip(curr.per_core.iter())
+            .map(|(p, c)| {
+                let p_total = cpu_total(p);
+                let c_total = cpu_total(c);
+                let p_steal = p.steal.unwrap_or(0);
+                let c_steal = c.steal.unwrap_or(0);
+
+                let delta_total = c_total.saturating_sub(p_total) as f64;
+                let delta_steal = c_steal.saturating_sub(p_steal) as f64;
+
+                if delta_total == 0.0 {
+                    0.0
+                } else {
+                    (delta_steal / delta_total * 100.0).clamp(0.0, 100.0)
+                }
+            })
+            .collect()
+    }
+
+    fn calculate_process_cores_used_with_caps(
+        &self,
+        process_utime_secs: &Option<f64>,
+        process_stime_secs: &Option<f64>,
+        prev: &Snapshot,
+        curr: &Snapshot,
+        elapsed: f64,
+        n_cores: usize,
+    ) -> Option<f64> {
+        match (self.pid, process_utime_secs, process_stime_secs) {
+            (Some(_), Some(u), Some(s)) => {
+                let raw_cores = ((u + s) / elapsed).max(0.0);
+
+                // Cap 1: tick-ratio bound
+                let sys_total_delta = cpu_total(&curr.total).saturating_sub(cpu_total(&prev.total));
+                let sys_idle_delta = cpu_idle(&curr.total).saturating_sub(cpu_idle(&prev.total));
+                let sys_busy_secs = if sys_total_delta > 0 {
+                    (sys_total_delta - sys_idle_delta.min(sys_total_delta)) as f64
+                        / procfs::ticks_per_second() as f64
+                } else {
+                    f64::MAX
+                };
+                let tick_ratio_cap = sys_busy_secs / elapsed;
+
+                // Cap 2: CFS quota
+                let quota_cap = self.cfs_quota.max_cores.unwrap_or(n_cores as f64);
+
+                Some(raw_cores.min(tick_ratio_cap).min(quota_cap))
+            }
+            _ => None,
+        }
+    }
+
+    fn calculate_disk_read_delta(&self, prev: &Snapshot, curr: &Snapshot) -> Option<u64> {
+        self.pid.map(|_| {
+            curr.proc_io
+                .iter()
+                .map(|(pid, &(cr, _))| {
+                    let pr = prev.proc_io.get(pid).map(|&(r, _)| r).unwrap_or(cr);
+                    cr.saturating_sub(pr)
+                })
+                .sum()
+        })
+    }
+
+    fn calculate_disk_write_delta(&self, prev: &Snapshot, curr: &Snapshot) -> Option<u64> {
+        self.pid.map(|_| {
+            curr.proc_io
+                .iter()
+                .map(|(pid, &(_, cw))| {
+                    let pw = prev.proc_io.get(pid).map(|&(_, w)| w).unwrap_or(cw);
+                    cw.saturating_sub(pw)
+                })
+                .sum()
+        })
+    }
+
+    // Carry forward entries for PIDs that disappeared
+    fn carry_forward_entries(&mut self, curr: &mut Snapshot) {
         let mut new_carried = HashSet::new();
+
         if let Some(ref prev_snap) = self.prev {
+            // Carry forward process ticks
             for (&pid, &ticks) in &prev_snap.proc_ticks {
                 if !curr.proc_ticks.contains_key(&pid) && !self.carried_forward.contains(&pid) {
                     curr.proc_ticks.insert(pid, ticks);
                     new_carried.insert(pid);
                 }
             }
+
+            // Carry forward process I/O
             for (&pid, &io) in &prev_snap.proc_io {
                 if !curr.proc_io.contains_key(&pid) && !self.carried_forward.contains(&pid) {
                     curr.proc_io.insert(pid, io);
                 }
             }
         }
-        self.carried_forward = new_carried;
 
-        self.prev = Some(curr);
-        Ok(metrics)
+        self.carried_forward = new_carried;
     }
 }
 
@@ -724,7 +866,7 @@ mod tests {
     // sleep then a second collect() produces real data.
     #[test]
     fn test_first_collect_returns_zero_for_delta_fields() {
-        let mut collector = CpuCollector::new(None);
+        let mut collector = CpuCollector::new(None, false);
         let metrics = collector.collect().expect("first collect failed");
         assert_eq!(
             metrics.utilization_pct, 0.0,
@@ -752,7 +894,7 @@ mod tests {
     #[test]
     fn test_first_collect_with_pid_returns_some_process_fields() {
         let pid = i32::try_from(std::process::id()).expect("PID too large");
-        let mut collector = CpuCollector::new(Some(pid));
+        let mut collector = CpuCollector::new(Some(pid), false);
         let m = collector.collect().expect("collect() failed");
         assert!(
             m.process_cores_used.is_some(),
@@ -825,7 +967,7 @@ mod tests {
     #[test]
     fn test_second_collect_with_pid_nonneg_cores() {
         let pid = i32::try_from(std::process::id()).expect("PID too large");
-        let mut collector = CpuCollector::new(Some(pid));
+        let mut collector = CpuCollector::new(Some(pid), false);
         let _ = collector.collect().expect("first collect() failed");
         let m = collector.collect().expect("second collect() failed");
         let cores = m
@@ -840,7 +982,7 @@ mod tests {
     // T-CPU-11: second collect() with no PID still returns None for all process fields.
     #[test]
     fn test_second_collect_no_pid_all_process_fields_none() {
-        let mut collector = CpuCollector::new(None);
+        let mut collector = CpuCollector::new(None, false);
         let _ = collector.collect().expect("first collect() failed");
         let m = collector.collect().expect("second collect() failed");
         assert!(
@@ -880,7 +1022,7 @@ mod tests {
     // T-CPU-12: process_count > 0 (at least one process is always visible).
     #[test]
     fn test_process_count_positive() {
-        let mut collector = CpuCollector::new(None);
+        let mut collector = CpuCollector::new(None, false);
         let m = collector.collect().expect("collect() failed");
         assert!(
             m.process_count > 0,
@@ -1016,7 +1158,7 @@ mod tests {
     #[test]
     fn test_process_cores_used_does_not_exceed_system_utilization() {
         let pid = i32::try_from(std::process::id()).expect("PID too large");
-        let mut collector = CpuCollector::new(Some(pid));
+        let mut collector = CpuCollector::new(Some(pid), false);
 
         // Spawn a CPU-busy child to simulate a long-running process on a
         // busy server.  A shell busy-loop accumulates real utime ticks.
@@ -1074,7 +1216,7 @@ mod tests {
     #[test]
     fn test_process_utime_no_double_count_after_child_exits() {
         let pid = i32::try_from(std::process::id()).expect("PID too large");
-        let mut collector = CpuCollector::new(Some(pid));
+        let mut collector = CpuCollector::new(Some(pid), false);
 
         // Spawn a child that burns a little CPU then exits naturally.
         // `sh` must be available on any Linux host used for testing.
@@ -1131,7 +1273,7 @@ mod tests {
     #[test]
     fn test_cutime_correction_multi_interval_child_exit() {
         let pid = i32::try_from(std::process::id()).expect("PID too large");
-        let mut collector = CpuCollector::new(Some(pid));
+        let mut collector = CpuCollector::new(Some(pid), false);
 
         // Spawn a CPU-busy child that accumulates real utime ticks.
         let mut child = std::process::Command::new("sh")

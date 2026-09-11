@@ -254,7 +254,6 @@ fn process_tree_memory_mib(pids: &[i32]) -> (u64, u64) {
     let mut total_rss_bytes = 0u64;
 
     for &pid in pids {
-
         let Some(process) = procfs::process::Process::new(pid).ok() else {
             continue;
         };
@@ -277,7 +276,10 @@ fn process_tree_memory_mib(pids: &[i32]) -> (u64, u64) {
         }
     }
 
-    (total_pss_bytes / BYTES_PER_MIB, total_rss_bytes / BYTES_PER_MIB)
+    (
+        total_pss_bytes / BYTES_PER_MIB,
+        total_rss_bytes / BYTES_PER_MIB,
+    )
 }
 
 /// Per-process cumulative disk I/O bytes from /proc/pid/io.
